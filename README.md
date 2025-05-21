@@ -4,6 +4,10 @@ Repository with different python and ipython scripts for getting LanammeUCR docu
 
 ## Script actions:
 
+- Load secret variables in selected environment
+  - Kaggle secrets add-on
+  - Local .env file
+  - OS keyring
 - Connect with repository
   - Retrieve records
   - Filter for records of specific matter
