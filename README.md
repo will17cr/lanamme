@@ -1,6 +1,6 @@
 # Lanamme scripts
 
-Repository with different python and ipython scripts done to get LanammeUCR documents metadata from DSpace repository and store it in spreadsheet as source for a visualization tool (like LookerStudio, Tableau, others).
+Repository with different python and ipython scripts for getting LanammeUCR documents metadata from DSpace repository and store it in spreadsheet as source for a visualization tool (like LookerStudio, Tableau, others).
 
 ## Script actions:
 
