@@ -1,6 +1,6 @@
 # Lanamme scripts
 
-Repository to store different python and ipython scripts done to get LanammeUCR documents from DSpace repository and elaborate a spreadsheet as source for a visualization tool (like LookerStudio, Tableau, others).
+Repository with different python and ipython scripts done to get LanammeUCR documents metadata from DSpace repository and store it in spreadsheet as source for a visualization tool (like LookerStudio, Tableau, others).
 
 ## Script actions:
 
@@ -8,13 +8,13 @@ Repository to store different python and ipython scripts done to get LanammeUCR 
   - Retrieve records
   - Filter for records of specific matter
   - Build dataframe from selected records
-- Connect with Google Sheet
+- Connect with Google Sheet by API
   - Retrieve master table
 - Get new records not in master table
 - Obtain pdf direct url for records with no pdf url
 - Request analysis to Gemini API
   - Send prompt to Gemini model by API
-  - Get response in form of JSON
+  - Get response and update dataframe
 - Append new records to master table in Google Sheet
 - Save new sheet with only new records
 
