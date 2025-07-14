@@ -1,1 +1,1146 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.11.11","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"none","dataSources":[],"isInternetEnabled":true,"language":"python","sourceType":"script","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"# %% [code]\n# %% [code]\n# %% [code]\n# coding: utf-8\n\n# --- System-level installations (apt-get) ---\n# These are crucial for external tools like Tesseract, Ghostscript, and Selenium's browser drivers\nprint(\"--- Starting system-level installations (apt-get) ---\")\n# Update package lists\n! apt-get update -y\n\n# Install Tesseract OCR and Spanish language pack\n# Install Ghostscript (dependency for ocrmypdf)\n# Install Firefox ESR (Extended Support Release) which often includes or works with geckodriver\n! apt-get install -y tesseract-ocr tesseract-ocr-spa ghostscript firefox-esr\n# Note: geckodriver is typically installed alongside firefox-esr or is available as a separate package.\n# If you still face issues with geckodriver, you might need to explicitly install `geckodriver` like:\n# ! apt-get install -y geckodriver\nprint(\"--- Finished system-level installations ---\")\n\n# --- Python library installations (pip) ---\nprint(\"\\n--- Starting Python library installations (pip) ---\")\n# Upgrade pip itself\n! pip install -U pip\n# Install all required Python packages in a single run for efficiency\n! pip install sickle oaipmh-scythe dateparser python-dateutil gspread gspread_dataframe google-api-python-client google-generativeai requests pdfplumber pymupdf ocrmypdf selenium beautifulsoup4 pytesseract Pillow python-dotenv\nprint(\"--- Finished Python library installations ---\")\n\nprint(\"\\nScript to request records from LANAMME's repository and update our data with AI analysis\")\n\n# --- Python Library Imports ---\n# It's best practice to put all imports at the top of the file after installations\nprint(\"\\nImporting Python libraries...\")\nimport os\nimport datetime as dt\nimport pandas as pd\nimport numpy as np\nimport re\nimport time\nfrom datetime import datetime\nimport json\nfrom io import BytesIO\nimport tempfile # Added for temporary file handling\n\n# DSpace library\nfrom sickle import Sickle\nfrom oaipmh_scythe import Scythe\n\n# Google Sheets libraries\nimport gspread\nfrom gspread_dataframe import set_with_dataframe, get_as_dataframe\n\n# Google Generative AI library\nimport google.generativeai as genai\n\n# PDF processing libraries\nimport fitz # PyMuPDF\nimport ocrmypdf\n\n# Web scraping and browser automation libraries\nimport requests\nimport pdfplumber\nfrom selenium import webdriver\nfrom selenium.webdriver.firefox.options import Options as FirefoxOptions\nfrom selenium.webdriver.firefox.service import Service as FirefoxService # Keep for explicit service if needed later\nfrom bs4 import BeautifulSoup\nfrom urllib.parse import urlparse, urljoin\n\n# OCR specific libraries\nimport pytesseract\nfrom PIL import Image\n\n# For local secrets loading\nfrom dotenv import load_dotenv, find_dotenv # Imported here, used below for local env\n\nprint(\"All necessary Python libraries imported.\")\n\nprint(\"\\nMain variables setup\")\n\nURL = 'https://www.lanamme.ucr.ac.cr/oai/request?'\nDSpace_start='2024-01-01'\nMASTER_SHEET_NAME = 'Master'\nRISK_CATEGORIES = [\"ninguno\", \"bajo\", \"medio\", \"alto\", \"critico\"]\n\n# NEW: Define the cutoff date for Gemini AI processing\n# Records published strictly BEFORE this date will skip Gemini analysis\nGEMINI_PROCESSING_CUTOFF_DATE = datetime(2024, 1, 1)\nGEMINI_MODEL_NAME = 'gemini-1.5-pro-latest' # Or your preferred model like 'gemini-2.5-pro-preview-05-06'\n\n\n# --- SECRET LOADING ---\nif os.environ.get('KAGGLE_KERNEL_RUN_TYPE') in ('Interactive', 'Batch'):\n    print(\"Kaggle: Loading secrets.\")\n    from kaggle_secrets import UserSecretsClient # Import here as it's Kaggle-specific\n    user_secrets = UserSecretsClient()\n    try:\n        GEMINI_API_KEY = user_secrets.get_secret(\"GEMINI_API_KEY\")\n        GOOGLE_API_SECRET = user_secrets.get_secret(\"Google_API\")\n        GOOGLE_SHEET_ID = user_secrets.get_secret(\"NewSheetID\")\n        print(\"Kaggle secrets loaded.\")\n    except Exception as e:\n        print(f\"Error Kaggle Secrets: {e}\"); GEMINI_API_KEY, GOOGLE_API_SECRET, GOOGLE_SHEET_ID = None, None, None\nelse:\n    print(\"Local: Loading secrets from env.\");\n    # Load .env file if it exists for local development\n    if find_dotenv():\n        print(\"Found .env file, loading.\")\n        _ = load_dotenv(find_dotenv())\n    else:\n        print(\".env file not found for local dev. Ensure environment variables are set manually.\")\n    \n    # Use os.environ.get() to safely retrieve environment variables (returns None if not found)\n    GEMINI_API_KEY = os.environ.get(\"GEMINI_API_KEY\")\n    GOOGLE_API_SECRET = os.environ.get(\"Google_API\")\n    GOOGLE_SHEET_ID = os.environ.get(\"NewSheetID\")\n    print(\"Local env secrets loaded (or attempted).\")\n\n\n# --- GEMINI MODEL CONFIG ---\nif GEMINI_API_KEY:\n    genai.configure(api_key=GEMINI_API_KEY)\n    try:\n        generation_config = genai.types.GenerationConfig(response_mime_type=\"application/json\")\n        model = genai.GenerativeModel(GEMINI_MODEL_NAME, generation_config=generation_config)\n        print(f\"Gemini model '{GEMINI_MODEL_NAME}' initialized for JSON.\")\n    except Exception as e:\n        print(f\"Error initializing Gemini: {e}\"); model = None\nelse:\n    model = None; print(\"Gemini API Key not found/model init failed. AI processing skipped.\")\n\n# --- HELPER FUNCTIONS ---\n\ndef get_pdf_url(url):\n    # Only use Firefox\n    browser = None\n    try:\n        print(f\"    Trying Firefox for {url}...\")\n        options = FirefoxOptions()\n        options.add_argument(\"--headless\")\n        options.add_argument(\"--disable-gpu\")\n        # In Kaggle, geckodriver should be in PATH after apt-get install firefox-esr\n        browser = webdriver.Firefox(options=options)\n        \n        if not url or not isinstance(url, str) or not url.startswith('http'):\n            print(f\"    get_direct_pdf_url: Invalid page_url: '{url}'\")\n            return None\n\n        browser.get(f\"{url}?show=full\")\n        time.sleep(0.8) # Wait for 800ms to allow page to load content\n        \n        pagina = BeautifulSoup(browser.page_source, 'html.parser')\n        pdf_url_tag = pagina.find('meta', {'name': 'citation_pdf_url'})\n        \n        if pdf_url_tag:\n            pdf_url = pdf_url_tag['content']\n            print(f\"    Firefox found PDF URL: {pdf_url}\")\n            return pdf_url\n        else:\n            print(f\"    Firefox: No citation_pdf_url meta tag found for '{url}'.\")\n            return None\n    except Exception as e:\n        print(f\"    Error with Firefox for {url}: {e}. Failed to get PDF URL.\")\n        return None\n    finally:\n        if browser:\n            browser.quit()\n\n\ndef extract_text_from_pdf_url(pdf_url):\n    \"\"\"Fetches a PDF from a URL and extracts text content using pdfplumber.\"\"\"\n    if not pdf_url or not isinstance(pdf_url, str) or not pdf_url.lower().endswith('.pdf'):\n        print(f\"Invalid or non-PDF URL: {pdf_url}\")\n        return None\n    try:\n        response = requests.get(pdf_url, timeout=30) # Added timeout\n        response.raise_for_status() # Raises an exception for bad status codes\n        \n        text_content = \"\"\n        with BytesIO(response.content) as pdf_file:\n            with pdfplumber.open(pdf_file) as pdf:\n                for page in pdf.pages:\n                    page_text = page.extract_text()\n                    if page_text:\n                        text_content += page_text + \"\\n\"\n        return text_content.strip() if text_content else None\n    except requests.exceptions.RequestException as e:\n        print(f\"Error downloading PDF from {pdf_url}: {e}\")\n    except Exception as e:\n        print(f\"Error extracting text from PDF {pdf_url}: {e}\")\n    return None\n\n\ndef extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):\n    \"\"\"\n    Fetches a PDF document from a given DIRECT PDF URL, saves it to a temporary file,\n    processes it with ocrmypdf saving to another temporary file, and then extracts\n    its text content using PyMuPDF (fitz) from the OCR'd temporary file.\n\n    Args:\n        pdf_url_direct (str): The URL of the PDF document to process.\n        lang_code (str): The language code for OCR (e.g., 'spa' for Spanish) for ocrmypdf.\n\n    Returns:\n        str or None: The extracted text content from the OCR'd PDF as a single string,\n                     or None if any error occurs.\n    \"\"\"\n    if not pdf_url_direct or not isinstance(pdf_url_direct, str) or not pdf_url_direct.lower().startswith('http'):\n        print(f\"  OCRmyPDF: Error - Invalid URL format for PDF processing: '{pdf_url_direct}'\")\n        return None\n    \n    if not pdf_url_direct.lower().endswith('.pdf'):\n        print(f\"  OCRmyPDF: Warning - Direct PDF URL does not end with .pdf: '{pdf_url_direct}'. Attempting download anyway.\")\n\n    input_pdf_path = None\n    output_pdf_path = None\n\n    try:\n        print(f\"  OCRmyPDF: Attempting to download direct PDF from: {pdf_url_direct}\")\n        response = requests.get(pdf_url_direct, timeout=60, headers={'User-Agent': 'Mozilla/5.0'})\n        response.raise_for_status()  # Raise an exception for bad status codes\n        \n        content_type = response.headers.get('content-type', '').lower()\n        if 'application/pdf' not in content_type:\n            print(f\"  OCRmyPDF: ERROR - Content-Type is '{content_type}', not 'application/pdf'. URL '{pdf_url_direct}' may not be a direct PDF link.\")\n            return None\n            \n        print(f\"  OCRmyPDF: Direct PDF downloaded (status {response.status_code}). Size: {len(response.content)} bytes.\")\n        \n        pdf_bytes_original = response.content\n        text_content = \"\"\n        \n        # Create a named temporary file for the input PDF\n        with tempfile.NamedTemporaryFile(delete=False, suffix=\".pdf\") as tmp_in:\n            input_pdf_path = tmp_in.name\n            tmp_in.write(pdf_bytes_original)\n        \n        # Create a named temporary file path for the output PDF\n        with tempfile.NamedTemporaryFile(delete=False, suffix=\".pdf\") as tmp_out:\n            output_pdf_path = tmp_out.name\n\n        print(f\"  OCRmyPDF: Input temp file: {input_pdf_path}\")\n        print(f\"  OCRmyPDF: Output temp file: {output_pdf_path}\")\n\n        try:\n            ocrmypdf.ocr(input_pdf_path, output_pdf_path,\n                         language=lang_code,\n                         force_ocr=True,\n                         deskew=True,\n                         optimize=2,\n                         skip_text=False,\n                         invalidate_digital_signatures=True\n                        )\n            print(f\"  OCRmyPDF: OCR process completed. Output saved to {output_pdf_path}\")\n            \n            doc = fitz.open(output_pdf_path) \n            print(f\"  OCRmyPDF: Extracting text from {len(doc)} page(s) of OCR'd PDF file...\")\n            for page_num in range(len(doc)):\n                page = doc.load_page(page_num)\n                page_text = page.get_text(\"text\")\n                if page_text:\n                    text_content += page_text + \"\\n\"\n            doc.close()\n\n            if text_content.strip():\n                print(f\"  OCRmyPDF: Text extraction complete from OCR'd PDF file.\")\n            else:\n                print(f\"  OCRmyPDF: No text could be extracted from OCR'd PDF file (it might be empty or OCR yielded no text).\")\n            \n        except ocrmypdf.exceptions.InputFileError as e:\n            print(f\"  OCRmyPDF Input Error for '{pdf_url_direct}' (using file {input_pdf_path}): {e}.\")\n            return None\n        except ocrmypdf.exceptions.InvalidInputError as e:\n            print(f\"  OCRmyPDF Invalid Input Error for '{pdf_url_direct}' (using file {input_pdf_path}): {e}.\")\n            return None\n        except ocrmypdf.exceptions.MissingDependencyError as e:\n            print(f\"  OCRmyPDF Missing Dependency Error: {e}. Ensure all ocrmypdf dependencies (like Tesseract, Ghostscript) are installed.\")\n            return None\n        except ocrmypdf.exceptions.EncryptedPdfError as e:\n            print(f\"  OCRmyPDF Encrypted PDF Error for '{pdf_url_direct}': {e}.\")\n            return None\n        except Exception as e_ocrmypdf_process:\n            print(f\"  OCRmyPDF: General error during OCR processing or text extraction from file for '{pdf_url_direct}': {type(e_ocrmypdf_process).__name__} - {e_ocrmypdf_process}\")\n            return None\n            \n        return text_content.strip() if text_content.strip() else None\n\n    except requests.exceptions.Timeout:\n        print(f\"OCRmyPDF: Error downloading PDF from '{pdf_url_direct}': Request timed out.\")\n        return None \n    except requests.exceptions.RequestException as e_req:\n        print(f\"OCRmyPDF: Error downloading PDF from '{pdf_url_direct}': {e_req}\")\n        return None \n    except Exception as e_generic:\n        print(f\"OCRmyPDF: Generic error during PDF download/setup for '{pdf_url_direct}': {e_generic}\")\n        return None \n    finally:\n        if input_pdf_path and os.path.exists(input_pdf_path):\n            try:\n                os.remove(input_pdf_path)\n                print(f\"  OCRmyPDF: Cleaned up input temp file: {input_pdf_path}\")\n            except Exception as e_cleanup_in:\n                print(f\"  OCRmyPDF: Warning - could not delete input temp file {input_pdf_path}: {e_cleanup_in}\")\n        if output_pdf_path and os.path.exists(output_pdf_path):\n            try:\n                os.remove(output_pdf_path)\n                print(f\"  OCRmyPDF: Cleaned up output temp file: {output_pdf_path}\")\n            except Exception as e_cleanup_out:\n                print(f\"  OCRmyPDF: Warning - could not delete output temp file {output_pdf_path}: {e_cleanup_out}\")\n\n\ndef extract_text_from_pdf_fitz(pdf_url_direct):\n    \"\"\"\n    Fetches a PDF document from a given DIRECT PDF URL and extracts its text content\n    using PyMuPDF (fitz).\n\n    Args:\n        pdf_url_direct (str): The URL of the PDF document to process.\n\n    Returns:\n        str or None: The extracted text content from the PDF as a single string,\n                     or None if any error occurs.\n    \"\"\"\n    if not pdf_url_direct or not isinstance(pdf_url_direct, str) or not pdf_url_direct.lower().startswith('http'):\n        print(f\"  Fitz: Error - Invalid URL format for PDF extraction: '{pdf_url_direct}'\")\n        return None\n    \n    if not pdf_url_direct.lower().endswith('.pdf'):\n        print(f\"  Fitz: Warning - Direct PDF URL does not end with .pdf: '{pdf_url_direct}'. Attempting download.\")\n\n    try:\n        print(f\"  Fitz: Attempting to download direct PDF from: {pdf_url_direct}\")\n        response = requests.get(pdf_url_direct, timeout=45, headers={'User-Agent': 'Mozilla/5.0'})\n        response.raise_for_status()  \n        \n        content_type = response.headers.get('content-type', '').lower()\n        if 'application/pdf' not in content_type:\n            print(f\"  Fitz: ERROR - Content-Type is '{content_type}', not 'application/pdf'. URL '{pdf_url_direct}' may not be a direct PDF link.\")\n            return None \n            \n        print(f\"  Fitz: Direct PDF downloaded (status {response.status_code}). Size: {len(response.content)} bytes.\")\n        \n        pdf_bytes = response.content\n        text_content = \"\"\n        \n        # Open PDF from bytes using PyMuPDF\n        try:\n            doc = fitz.open(stream=pdf_bytes, filetype=\"pdf\")\n            print(f\"  Fitz: Extracting text from {len(doc)} page(s)...\")\n            for page_num in range(len(doc)):\n                page = doc.load_page(page_num)\n                page_text = page.get_text(\"text\") \n                if page_text:\n                    text_content += page_text + \"\\n\"\n            doc.close()\n            if text_content:\n                print(f\"  Fitz: Text extraction complete.\")\n            else:\n                print(f\"  Fitz: No text could be extracted (PDF might be image-based or empty of text).\")\n        except Exception as e_fitz:\n            print(f\"  Fitz: Error opening or parsing PDF with PyMuPDF from '{pdf_url_direct}': {e_fitz}\")\n            return None \n            \n        return text_content.strip() if text_content.strip() else None \n\n    except requests.exceptions.Timeout:\n        print(f\"Fitz: Error downloading PDF from '{pdf_url_direct}': Request timed out.\")\n    except requests.exceptions.RequestException as e_req:\n        print(f\"Fitz: Error downloading PDF from '{pdf_url_direct}': {e_req}\")\n    except Exception as e_generic:\n        print(f\"Fitz: Generic error during PDF processing for '{pdf_url_direct}': {e_generic}\")\n    return None\n\n\ndef extract_text_from_pdf_ocr(pdf_url_direct, lang_code='spa'):\n    \"\"\"\n    Fetches a PDF from a URL, renders its pages as images, and extracts text using OCR.\n    This is a fallback method and can be slower and more resource-intensive.\n\n    Args:\n        pdf_url_direct (str): The direct URL of the PDF document.\n        lang_code (str): The language code for Tesseract OCR (e.g., 'spa' for Spanish).\n\n    Returns:\n        str or None: The extracted text content from OCR, or None if errors occur.\n    \"\"\"\n    if not pdf_url_direct or not isinstance(pdf_url_direct, str) or not pdf_url_direct.lower().startswith('http'):\n        print(f\"  OCR (Pytesseract): Error - Invalid URL for PDF: '{pdf_url_direct}'\")\n        return None\n\n    try:\n        print(f\"  OCR (Pytesseract): Attempting download for OCR: {pdf_url_direct}\")\n        response = requests.get(pdf_url_direct, timeout=45, headers={'User-Agent': 'Mozilla/5.0'})\n        response.raise_for_status()\n        \n        content_type = response.headers.get('content-type', '').lower()\n        if 'application/pdf' not in content_type:\n            print(f\"  OCR (Pytesseract): ERROR - Content-Type is '{content_type}', not PDF. URL '{pdf_url_direct}'\")\n            return None\n            \n        pdf_bytes = response.content\n        print(f\"  OCR (Pytesseract): PDF downloaded for OCR. Size: {len(pdf_bytes)} bytes.\")\n        \n        all_ocr_text = \"\"\n        doc = None\n        try:\n            doc = fitz.open(stream=pdf_bytes, filetype=\"pdf\")\n            print(f\"  OCR (Pytesseract): Processing {len(doc)} pages with Tesseract (lang: {lang_code})...\")\n            for page_num in range(len(doc)):\n                page = doc.load_page(page_num)\n                pix = page.get_pixmap(dpi=300)\n                img_bytes = pix.tobytes(\"png\") \n                \n                try:\n                    pil_image = Image.open(BytesIO(img_bytes))\n                    page_ocr_text = pytesseract.image_to_string(pil_image, lang=lang_code)\n                    if page_ocr_text:\n                        all_ocr_text += page_ocr_text + \"\\n\\n\" \n                    print(f\"    OCR (Pytesseract): Page {page_num + 1} processed.\")\n                except Exception as e_ocr_page:\n                    print(f\"    OCR (Pytesseract): Error processing page {page_num + 1} with Tesseract: {e_ocr_page}\")\n            if all_ocr_text.strip():\n                print(\"  OCR (Pytesseract): Text extraction via OCR complete.\")\n            else:\n                print(\"  OCR (Pytesseract): No text extracted via OCR (document might be truly empty or OCR failed on all pages).\")\n        except Exception as e_ocr_fitz:\n            print(f\"  OCR (Pytesseract): Error opening PDF with PyMuPDF for OCR: {e_ocr_fitz}\")\n            return None \n        finally:\n            if doc:\n                doc.close()\n        \n        return all_ocr_text.strip() if all_ocr_text.strip() else None\n\n    except requests.exceptions.Timeout:\n        print(f\"OCR (Pytesseract): Timeout downloading PDF for OCR: '{pdf_url_direct}'\")\n    except requests.exceptions.RequestException as e_req_ocr:\n        print(f\"OCR (Pytesseract): Request error downloading PDF for OCR: {e_req_ocr}\")\n    except Exception as e_generic_ocr:\n        print(f\"OCR (Pytesseract): Generic error during PDF download/setup for OCR: {e_generic_ocr}\")\n    return None\n\n\ndef get_gemini_analysis(document_text):\n    default_error_rating = \"Error: AI Analysis default\"\n    default_error_explanation = \"Error: AI Explanation default\"\n    default_error_summary = \"Error: AI Summary default\"\n\n    final_rating = default_error_rating\n    final_explanation = default_error_explanation\n    final_summary = default_error_summary\n\n    if not model or not document_text:\n        print(\"         Gemini model/text unavailable.\")\n        return final_rating, final_explanation, final_summary\n\n    prompt_combined_json = f\"\"\"\n    Analyze the following document text, which is in Spanish.\n    Based on your analysis, generate a JSON object with the following three keys:\n    1. \"riesgo_rating\": A single string value representing the overall risk level. Choose EXCLUSIVELY from this list: {RISK_CATEGORIES}. This rating should be based on the presence, severity, and quantity of warning/alarming statements, and the extent of any danger stated.\n    2. \"riesgo_explicacion\": A detailed textual explanation IN SPANISH. Start your explanation by explicitly stating the assigned 'riesgo_rating' and then detail the primary reasons for this rating, referencing specific warnings, dangers, and concerns from the document. For example: 'El riesgo se considera [valor de riesgo_rating] debido a [razones principales y detalles específicos del documento].' Ensure any special characters like backslashes or quotes within this explanation are correctly escaped for JSON string format (e.g., a backslash should be '\\\\\\\\', a quote '\\\"').\n    3. \"resumen_detallado_ia\": A comprehensive and explanatory summary of the entire document, IN SPANISH. This summary should focus on key findings, methodologies (if applicable), conclusions, and recommendations. Ensure any special characters like backslashes or quotes within this summary are correctly escaped for JSON string format.\n\n    Ensure the output is ONLY a valid JSON object. Do not add any text before or after the JSON object. All string values inside the JSON must be properly JSON escaped. Example format:\n    {{\n      \"riesgo_rating\": \"bajo\",\n      \"riesgo_explicacion\": \"El riesgo se considera bajo porque solo se mencionaron algunas preocupaciones menores y no hay indicios de peligro inminente. Por ejemplo, una ruta de archivo podría ser C:\\\\\\\\Users\\\\\\\\temp.\",\n      \"resumen_detallado_ia\": \"El documento trata sobre la \\\\\"importancia\\\\\" de...\"\n    }}\n\n    Document Text (Spanish):\n    ---\n    {document_text[:150000]} \n    ---\n\n    JSON Output:\n    \"\"\"\n\n    print(\"         Requesting JSON (rating, explanation, summary) from Gemini...\")\n    \n    raw_text_from_gemini_for_debug = \"No response received\"\n    json_candidate_text_for_debug = \"No JSON candidate formed\"\n    \n    try:\n        response = model.generate_content(prompt_combined_json, request_options={'timeout': 180})\n\n        if not response.parts:\n            block_reason_str = \"Unknown reason\"\n            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:\n                if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason is not None:\n                    block_reason_str = str(response.prompt_feedback.block_reason)\n                elif hasattr(response.prompt_feedback, 'safety_ratings'):\n                    print(f\"            Safety ratings: {response.prompt_feedback.safety_ratings}\")\n                    for rating_info in response.prompt_feedback.safety_ratings:\n                        if rating_info.probability not in [genai.types.HarmProbability.NEGLIGIBLE, genai.types.HarmProbability.LOW]:\n                            block_reason_str = f\"Safety block - Category: {rating_info.category}, Probability: {rating_info.probability.name}\"\n                            break\n            print(f\"         Gemini API Warning: No content parts in response. Effective Block reason: {block_reason_str}.\")\n            final_rating = f\"AI Error: No Parts ({block_reason_str})\"\n            return final_rating, final_explanation, final_summary\n\n        raw_text_from_gemini_for_debug = response.text\n        \n        try:\n            text_to_parse = raw_text_from_gemini_for_debug.strip()\n            \n            if text_to_parse.startswith(\"```json\"):\n                text_to_parse = text_to_parse[len(\"```json\"):]\n            if text_to_parse.endswith(\"```\"):\n                text_to_parse = text_to_parse[:-len(\"```\")]\n            text_to_parse = text_to_parse.strip()\n\n            first_brace = text_to_parse.find('{')\n            last_brace = text_to_parse.rfind('}')\n\n            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:\n                json_candidate_text = text_to_parse[first_brace : last_brace+1]\n                print(f\"         Attempting JSON parse (extracted from braces): {json_candidate_text[:100]}...\")\n            else:\n                json_candidate_text = text_to_parse\n                print(f\"         No clear JSON braces found after stripping markdown, attempting parse on: {json_candidate_text[:100]}...\")\n            \n            json_candidate_text_for_debug = json_candidate_text\n\n            try:\n                response_json = json.loads(json_candidate_text)\n            except json.JSONDecodeError as e_strict:\n                print(f\"         JSONDecodeError (standard strict parsing): {e_strict}. Trying with strict=False.\")\n                try:\n                    response_json = json.loads(json_candidate_text, strict=False)\n                    print(\"         Successfully parsed with strict=False.\")\n                except json.JSONDecodeError as e_non_strict:\n                    print(f\"         JSONDecodeError (strict=False also failed): {e_non_strict}.\")\n                    raise e_strict \n\n            final_rating = response_json.get(\"riesgo_rating\", default_error_rating).strip().lower()\n            final_explanation = response_json.get(\"riesgo_explicacion\", default_error_explanation).strip()\n            final_summary = response_json.get(\"resumen_detallado_ia\", default_error_summary).strip()\n\n            if final_rating not in RISK_CATEGORIES and not final_rating.startswith(\"Error:\") and not final_rating.startswith(\"AI Error:\") and not final_rating.startswith(\"API Exception:\"):\n                print(f\"         Warning: Gemini returned an invalid risk category: '{final_rating}'.\")\n                final_rating = f\"Error: Invalid Category ({final_rating})\"\n            \n        except json.JSONDecodeError as e_json:\n            print(f\"         FATAL Error decoding JSON from Gemini: {e_json}.\")\n            print(f\"         --- Start of problematic text that caused JSON error (length: {len(json_candidate_text_for_debug)}) ---\")\n            printable_debug_text = ''.join(c if c.isprintable() or c.isspace() else f'\\\\x{ord(c):02x}' for c in json_candidate_text_for_debug)\n            print(printable_debug_text)\n            print(f\"         --- End of problematic text ---\")\n            final_rating = \"Error: JSON Decode\"\n            final_explanation = f\"JSON Error - {e_json}\"\n            final_summary = f\"JSON Error - {e_json}\" # Corrected variable name\n        except AttributeError as e_attr:\n            print(f\"         Error accessing Gemini response attributes (e.g., .text is None): {e_attr}\")\n            final_rating = \"Error: Response Attribute\"\n        except Exception as e_parse:\n            print(f\"         Unexpected error during Gemini response parsing: {e_parse}\")\n            final_rating = \"Error: Parse Exception\"\n\n    except Exception as e_api:\n        print(f\"         Major Error during Gemini API call or critical response issue: {type(e_api).__name__} - {e_api}\")\n        final_rating = f\"API Exception: {type(e_api).__name__}\"\n        \n    return final_rating, final_explanation, final_summary\n    \n\ndef get_dspace_data(url):\n    print(\"Connecting to DSpace repository...\"); \n    # Increased timeout and retries for Sickle\n    sickle_instance = Sickle(url, max_retries=5, timeout=120) # timeout in seconds\n    try:\n        records = sickle_instance.ListRecords(metadataPrefix='oai_dc', ignore_deleted=True)\n        mylist = [] # Initialize mylist\n        count = 0\n        for record in records: \n            mylist.append(record.metadata)\n            count += 1\n            if count % 100 == 0: \n                print(f\"  Processed {count} DSpace records...\")\n        if not mylist: \n            print(\"No records from DSpace.\"); \n            return pd.DataFrame()\n        myDF = pd.DataFrame(mylist)\n        print(f\"Retrieved {len(myDF)} raw DSpace records.\")\n        return myDF\n    except Exception as e: \n        print(f\"Error DSpace: {e}\")\n        return pd.DataFrame()\n\n\ndef get_dspace_data_scythe(url):\n    print(\"Connecting to DSpace repository and requesting records...\")\n    \n    scythe = Scythe(url, \n                    # user_agent=user_agent_string, \n                    max_retries=10, \n                    timeout=120)\n    try:\n        records = scythe.list_records(metadata_prefix='oai_dc',from_= DSpace_start, ignore_deleted=True)\n        mylist = list()\n        for i, record in enumerate(records):\n            mylist.append(record.metadata)\n            if (i + 1) % 100 == 0: print(f\"  Processed {i+1} records from DSpace...\")\n        if not mylist: print(\"No records found in DSpace repository.\"); return pd.DataFrame()\n        myDF = pd.DataFrame(mylist)\n        print(f\"Successfully retrieved {len(myDF)} raw records from DSpace.\")\n        return myDF\n    except Exception as e:\n        print(f\"Error retrieving data from DSpace: {e}\"); return pd.DataFrame()\n\ndef process_dspace_records(myDF_raw):\n    if myDF_raw.empty: return pd.DataFrame()\n    print(\"Processing DSpace records (Original Logic for DSpace fields)...\")\n    myDF = myDF_raw.copy()\n    myDF[\"matter\"]=False\n    myDF.loc[myDF.type.isna(),\"type\"]=myDF.loc[myDF.type.isna(),\"type\"].apply(lambda x:[\"\"])\n    myDF['tipos_str'] = [', '.join(map(str, l)) for l in myDF['type']]\n    s1=myDF[\"type\"].explode(); cond = s1.str.contains('informe', case=False, na=False)\n    myDF.loc[s1[cond].index.unique(),\"matter\"]=True; myDF=myDF[myDF.matter].copy()\n    if myDF.empty: print(\"No 'informe' records after filtering.\"); return pd.DataFrame()\n\n    myDF.loc[:,'resumen']=myDF.description.apply(lambda x: x[0] if isinstance(x, list) and x else None)\n    myDF.loc[myDF.subject.isna(),\"subject\"]=myDF.loc[myDF.subject.isna(),\"subject\"].apply(lambda x:[\"\"])\n    myDF['topicos_str'] = [', '.join(map(str, l)) for l in myDF['subject']]\n    myDF.loc[:,\"publicado_str\"]=myDF.date.apply(lambda x: x[2] if isinstance(x, list) and len(x) > 2 else (x[0] if isinstance(x, list) and len(x) > 0 else None))\n    \n    # Moved dateparser import to the top of the script\n    myDF.loc[:,\"fecha_publicado\"]=myDF.publicado_str.apply(lambda x: dateparser.parse(x, languages=['es'], settings={'PREFER_DAY_OF_MONTH': 'first', \"PREFER_MONTH_OF_YEAR\": \"first\"}) if pd.notna(x) else pd.NaT)\n    myDF['fecha_publicado'] = pd.to_datetime(myDF['fecha_publicado'], errors='coerce')\n    myDF.loc[:,\"fecha_str\"]=myDF.date.apply(lambda x: x[0] if isinstance(x, list) and x else None)\n    myDF.loc[:,'titulo']=myDF.title.apply(lambda x: x[0] if isinstance(x, list) and x else None)\n    myDF.loc[:,'title_N']=myDF.title.apply(lambda x: len(x) if isinstance(x, list) else 0) \n    myDF['consecutivo'] = pd.NA\n    myDF.loc[myDF.title_N!=1,\"consecutivo\"]=myDF.loc[myDF.title_N!=1,\"title\"].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else pd.NA) \n    myDF['relaciones_str'] = pd.NA\n    myDF.loc[~myDF.relation.isna(),\"relaciones_str\"]=myDF.loc[~myDF.relation.isna(),\"relation\"].apply(lambda x: x[0] if isinstance(x, list) and x else pd.NA)\n    myDF.loc[~myDF.relaciones_str.isna(),\"relaciones_str\"]=myDF.loc[~myDF.relaciones_str.isna(),\"relaciones_str\"].apply(lambda x: x.replace(\";\",\"\") if isinstance(x, str) else x)\n    fill_consecutivo_mask = myDF.consecutivo.isna() & myDF.relaciones_str.notna()\n    myDF.loc[fill_consecutivo_mask,\"consecutivo\"] = myDF.loc[fill_consecutivo_mask,\"relaciones_str\"] \n    myDF['autores']= myDF.creator.apply(lambda x: '; '.join(map(str, x)) if isinstance(x, list) and x else None)\n    myDF.loc[myDF.publisher.isna(),\"publisher\"]=myDF.loc[myDF.publisher.isna(),\"publisher\"].apply(lambda x:[\"\"])\n    myDF.loc[~myDF.publisher.isna(),'publicador']=myDF.loc[~myDF.publisher.isna(),\"publisher\"].apply(lambda x: x[0] if isinstance(x, list) and x else None)\n    myDF.loc[:,'formato']=myDF.format.apply(lambda x: x[0] if isinstance(x, list) and x else None)\n    myDF.loc[~myDF.language.isna(),'idioma']=myDF.loc[~myDF.language.isna(),\"language\"].apply(lambda x: x[0] if isinstance(x, list) and x else None)\n    myDF.loc[:,'enlace'] = myDF.identifier.apply(lambda x: x[-1] if isinstance(x, list) and x and isinstance(x[-1], str) and x[-1].startswith('http') else None)\n\n    original_dspace_columns = [\n        'enlace', 'titulo', 'title_N', 'autores', 'fecha_publicado', 'resumen',\n        'topicos_str', 'tipos_str', 'publicador', 'formato', 'idioma', 'consecutivo',\n        'fecha_str', 'publicado_str', 'relaciones_str'\n    ]\n    finalDF_original_fields = pd.DataFrame()\n    for col_name in original_dspace_columns: \n        if col_name in myDF.columns:\n            finalDF_original_fields[col_name] = myDF[col_name]\n        else: \n            finalDF_original_fields[col_name] = 0 if col_name == 'title_N' else \\\n                                                (pd.NaT if col_name == 'fecha_publicado' else \"\")\n            print(f\"Warning: DSpace column '{col_name}' was missing, initialized default.\")\n            \n    finalDF_original_fields.sort_values(by='fecha_publicado',ascending=False,inplace=True)\n    finalDF_original_fields.reset_index(drop=True, inplace=True)\n    print(f\"{len(finalDF_original_fields)} DSpace records processed for original fields.\")\n    return finalDF_original_fields\n\ndef get_google_sheet_connection(api_secret_json_str, sheet_id_or_name): \n    if not api_secret_json_str: print(\"Google API secret is missing.\"); return None\n    try: \n        credentials_dict = json.loads(api_secret_json_str)\n        gc = gspread.service_account_from_dict(credentials_dict)\n        sh = gc.open_by_key(sheet_id_or_name)\n        print(f\"Connected to GSheet: {sh.title}\")\n        return sh\n    except Exception as e: print(f\"Error connecting GSheet: {e}\"); return None\n\ndef get_master_sheet_data(sheet_connection, sheet_name): \n    default_ai_cols = {'riesgo': \"Not generated\", 'risk_explanation': \"Not generated\", 'resumen_IA': \"Not generated\"}\n    all_expected_master_cols = [\n        'enlace', 'titulo', 'title_N', 'autores', 'fecha_publicado', 'resumen',\n        'topicos_str', 'tipos_str', 'publicador', 'formato', 'idioma', 'consecutivo',\n        'fecha_str', 'publicado_str', 'relaciones_str',\n        'pdf_link_direct', 'riesgo', 'risk_explanation', 'resumen_IA'\n    ]\n    try:\n        worksheet = sheet_connection.worksheet(sheet_name); print(f\"Reading master sheet: '{sheet_name}'\")\n        df = get_as_dataframe(worksheet, evaluate_formulas=True, header=0, na_filter=False, dtype=str) # Keep all as str initially\n        \n        for col_exp in all_expected_master_cols:\n            if col_exp not in df.columns:\n                print(f\"Warning: Column '{col_exp}' not found in master. Creating it.\")\n                if col_exp in default_ai_cols: df[col_exp] = default_ai_cols[col_exp]\n                elif col_exp == 'title_N': df[col_exp] = \"0\" \n                else: df[col_exp] = \"\" \n        \n        for col, default_val in default_ai_cols.items():\n            if col in df.columns: \n                # Ensure existing AI columns are string and fill if empty string or actual NaN (though na_filter=False)\n                df[col] = df[col].astype(str).replace('', default_val).fillna(default_val)\n        \n        if 'fecha_publicado' in df.columns: \n            df['fecha_publicado'] = pd.to_datetime(df['fecha_publicado'], errors='coerce')\n        \n        if 'title_N' in df.columns: \n            df['title_N'] = pd.to_numeric(df['title_N'], errors='coerce').fillna(0).astype(int)\n\n        # Ensure other non-AI, non-date, non-numeric specific columns are strings and filled\n        string_cols_to_check = [\n            'enlace', 'pdf_link_direct', 'titulo', 'autores', 'resumen', \n            'topicos_str', 'tipos_str', 'publicador', 'formato', 'idioma', \n            'consecutivo', 'fecha_str', 'publicado_str', 'relaciones_str'\n        ]\n        for col_str in string_cols_to_check:\n            if col_str in df.columns: \n                df[col_str] = df[col_str].astype(str).fillna(\"\")\n            \n        print(f\"Read {len(df)} records from '{sheet_name}'\"); return df, worksheet\n    except gspread.exceptions.WorksheetNotFound:\n        print(f\"Master sheet '{sheet_name}' not found. Will define structure for new one.\")\n        empty_df_data = {}\n        for col in all_expected_master_cols:\n            if col == 'fecha_publicado': empty_df_data[col] = pd.Series(dtype='datetime64[ns]')\n            elif col == 'title_N': empty_df_data[col] = pd.Series(dtype='int')\n            elif col in default_ai_cols: empty_df_data[col] = pd.Series([default_ai_cols[col]], dtype='str') if default_ai_cols[col] is not None else pd.Series(dtype='str')\n            else: empty_df_data[col] = pd.Series(dtype='str')\n        return pd.DataFrame(empty_df_data), None\n    except Exception as e:\n        print(f\"Error reading master: {e}\"); return pd.DataFrame(), None\n\n# --- MAIN SCRIPT LOGIC ---\ndef main():\n    print(\"Script started at:\", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))\n    if not GOOGLE_API_SECRET or not GOOGLE_SHEET_ID: print(\"Secrets missing for Google Sheets. Exiting.\"); return\n\n    # raw_dspace_df = get_dspace_data(URL)\n    raw_dspace_df = get_dspace_data_scythe(URL)\n    if raw_dspace_df.empty: print(\"No DSpace data obtained or DSpace error. Exiting.\"); return\n    base_df_from_dspace = process_dspace_records(raw_dspace_df)\n    if base_df_from_dspace.empty: print(\"No processable DSpace records ('informes'). Exiting.\"); return\n\n    augmented_dspace_df = base_df_from_dspace.copy()\n    # Ensure new columns are present before any merge or processing\n    for col_new in ['pdf_link_direct', 'riesgo', 'risk_explanation', 'resumen_IA']:\n        if col_new not in augmented_dspace_df.columns:\n            augmented_dspace_df[col_new] = \"Not generated\" if col_new in ['riesgo', 'risk_explanation', 'resumen_IA'] else \"\"\n    \n    gs_connection = get_google_sheet_connection(GOOGLE_API_SECRET, GOOGLE_SHEET_ID)\n    if not gs_connection: print(\"GSheet connection failed. Exiting.\"); return\n    \n    master_df, master_worksheet = get_master_sheet_data(gs_connection, MASTER_SHEET_NAME)\n    ALL_FINAL_COLUMNS = [ # This should match all_expected_master_cols from get_master_sheet_data\n        'enlace', 'titulo', 'title_N', 'autores', 'fecha_publicado', 'resumen',\n        'topicos_str', 'tipos_str', 'publicador', 'formato', 'idioma', 'consecutivo',\n        'fecha_str', 'publicado_str', 'relaciones_str',\n        'pdf_link_direct', 'riesgo', 'risk_explanation', 'resumen_IA'\n    ]\n\n    if master_worksheet is None: # If sheet didn't exist and get_master_sheet_data returned a template df and None worksheet\n        print(f\"Master sheet '{MASTER_SHEET_NAME}' did not exist. Attempting to create it.\")\n        try:\n            master_worksheet = gs_connection.add_worksheet(title=MASTER_SHEET_NAME, rows=1, cols=len(ALL_FINAL_COLUMNS))\n            master_worksheet.update([ALL_FINAL_COLUMNS], 'A1') # Write headers\n            print(f\"Master sheet '{MASTER_SHEET_NAME}' created with headers.\")\n            # master_df is already an empty df with correct columns/dtypes from get_master_sheet_data\n        except Exception as e: \n            print(f\"Could not create master sheet '{MASTER_SHEET_NAME}': {e}. Exiting.\"); return\n\n    print(\"\\nIdentifying records for direct PDF link extraction...\")\n    # Ensure 'enlace' and 'pdf_link_direct' are strings and filled in master_df\n    for col_check in ['enlace', 'pdf_link_direct']:\n        if col_check not in master_df.columns: master_df[col_check] = \"\"\n        else: master_df[col_check] = master_df[col_check].astype(str).fillna(\"\")\n\n    existing_enlaces_in_master = set(master_df['enlace'].loc[master_df['enlace'].astype(str) != ''])\n    \n    # Get 'enlace' from DSpace records that are NOT YET in master\n    new_dspace_records_for_pdf_check = augmented_dspace_df[\n        ~augmented_dspace_df['enlace'].astype(str).isin(existing_enlaces_in_master)\n    ].copy()\n    enlaces_from_new_dspace = set(new_dspace_records_for_pdf_check['enlace'].dropna())\n    print(f\"Found {len(enlaces_from_new_dspace)} 'enlace' URLs from new DSpace records for PDF link check.\")\n\n    # Get 'enlace' from master records that are MISSING 'pdf_link_direct'\n    enlaces_from_master_needing_pdf = set(\n        master_df.loc[\n            (master_df['pdf_link_direct'].astype(str) == '') & \n            (master_df['enlace'].astype(str) != ''), \n            'enlace'\n        ].dropna()\n    )\n    print(f\"Found {len(enlaces_from_master_needing_pdf)} 'enlace' URLs in Master needing PDF link check.\")\n    \n    unique_enlaces_to_fetch_pdf_for = enlaces_from_new_dspace.union(enlaces_from_master_needing_pdf)\n    print(f\"Total unique landing pages to process for PDF links: {len(unique_enlaces_to_fetch_pdf_for)}\")\n    \n    enlace_to_direct_pdf_map = {}\n    if unique_enlaces_to_fetch_pdf_for:\n        print(\"Starting Selenium/BS4 for direct PDF links...\")\n        processed_landing_count = 0\n        for i, landing_url in enumerate(list(unique_enlaces_to_fetch_pdf_for)): # Iterate over a list copy\n            print(f\"    Processing landing page {i+1}/{len(unique_enlaces_to_fetch_pdf_for)}: {landing_url}\")\n            if pd.notna(landing_url) and isinstance(landing_url, str) and landing_url.startswith('http'):\n                try:\n                    direct_pdf_url = get_pdf_url(landing_url) # This is your Selenium function\n                    enlace_to_direct_pdf_map[landing_url] = direct_pdf_url if direct_pdf_url else \"\"\n                    if direct_pdf_url: print(f\"      Mapped '{landing_url}' to direct PDF: '{direct_pdf_url}'\")\n                    else: print(f\"      Could not extract PDF URL for '{landing_url}'.\")\n                    processed_landing_count +=1\n                    if processed_landing_count > 0 and processed_landing_count % 5 == 0: # Pause every 5 requests\n                        print(f\"      Pausing for 3s after {processed_landing_count} pages...\"); time.sleep(3)\n                except Exception as e_sel_main:\n                    print(f\"      Error in get_pdf_url for '{landing_url}': {e_sel_main}\");\n                    enlace_to_direct_pdf_map[landing_url] = \"\" # Mark as failed\n            else:\n                enlace_to_direct_pdf_map[landing_url] = \"\" # Invalid landing_url\n        print(\"Finished Selenium/BS4 processing for direct PDF links.\")\n\n    # Update 'pdf_link_direct' in augmented_dspace_df (which contains all current DSpace items)\n    # This ensures new items being added to master will have the link if found\n    augmented_dspace_df['pdf_link_direct'] = augmented_dspace_df['enlace'].astype(str).map(enlace_to_direct_pdf_map).fillna(\n        augmented_dspace_df['pdf_link_direct'].astype(str).fillna('') # Keep existing if no new map, ensure string\n    )\n    \n    # Update 'pdf_link_direct' in the existing master_df for records that were missing it\n    if not master_df.empty and enlace_to_direct_pdf_map:\n        # Create a mask for rows in master_df that need updating\n        master_update_mask = (master_df['pdf_link_direct'].astype(str) == '') & \\\n                             (master_df['enlace'].astype(str).isin(enlace_to_direct_pdf_map.keys()))\n        \n        # Apply the map to the 'enlace' column for these rows\n        mapped_pdfs_for_master = master_df.loc[master_update_mask, 'enlace'].astype(str).map(enlace_to_direct_pdf_map)\n        \n        if not mapped_pdfs_for_master.empty:\n            master_df.loc[master_update_mask, 'pdf_link_direct'] = mapped_pdfs_for_master.fillna(\"\")\n            print(f\"Updated 'pdf_link_direct' for {master_update_mask.sum()} records in in-memory master_df.\")\n\n\n    # Identify truly new records to append to master\n    if master_df.empty or not existing_enlaces_in_master: # If master is empty or had no valid enlaces\n        new_records_df_for_append = augmented_dspace_df.copy()\n    else:\n        new_records_df_for_append = augmented_dspace_df[\n            ~augmented_dspace_df['enlace'].astype(str).isin(existing_enlaces_in_master)\n        ].copy()\n    print(f\"Final count of new records for appending to master: {len(new_records_df_for_append)}\")\n    \n    # Prepare and write new records to a dated sheet and append to master_df (in memory)\n    if not new_records_df_for_append.empty:\n        print(f\"Processing {len(new_records_df_for_append)} new records for Google Sheets...\")\n        df_to_write_to_sheets = new_records_df_for_append.copy()\n\n        # Apply GEMINI_PROCESSING_CUTOFF_DATE for AI fields in new records\n        for idx, row_new in df_to_write_to_sheets.iterrows():\n            pub_date = row_new.get('fecha_publicado') # This should be datetime object or NaT\n            if pd.notna(pub_date) and isinstance(pub_date, (datetime, pd.Timestamp)) and (pub_date < GEMINI_PROCESSING_CUTOFF_DATE):\n                df_to_write_to_sheets.loc[idx, ['riesgo', 'risk_explanation', 'resumen_IA']] = \"Not processed (Old)\"\n        \n        # --- Write to Dated Sheet ---\n        date_str = datetime.today().strftime('%Y-%m-%d')\n        new_sheet_title = f'New_{date_str}'\n        try:\n            # Ensure DataFrame for dated sheet has all columns in the right order\n            final_df_for_dated_sheet = df_to_write_to_sheets.reindex(columns=ALL_FINAL_COLUMNS).copy()\n            # Convert datetime to ISO string for gspread\n            for col_dt in final_df_for_dated_sheet.select_dtypes(include=['datetime64[ns]', 'datetime.date', 'datetime.datetime']).columns:\n                final_df_for_dated_sheet[col_dt] = final_df_for_dated_sheet[col_dt].apply(lambda x: x.isoformat() if pd.notnull(x) and hasattr(x, 'isoformat') else \"\")\n            final_df_for_dated_sheet = final_df_for_dated_sheet.fillna('') # Fill all NaNs with empty string for sheet\n\n            try:\n                new_records_worksheet = gs_connection.worksheet(new_sheet_title)\n                new_records_worksheet.clear()\n                print(f\"Cleared existing dated sheet: '{new_sheet_title}'.\")\n            except gspread.exceptions.WorksheetNotFound:\n                new_records_worksheet = gs_connection.add_worksheet(title=new_sheet_title, rows=max(1, len(final_df_for_dated_sheet) + 1), cols=len(ALL_FINAL_COLUMNS))\n            \n            set_with_dataframe(new_records_worksheet, final_df_for_dated_sheet, include_index=False, resize=True)\n            print(f\"Saved {len(final_df_for_dated_sheet)} new records to dated sheet: '{new_sheet_title}'\")\n        except Exception as e_dated:\n            print(f\"Error saving to dated sheet '{new_sheet_title}': {e_dated}\")\n\n        # --- Append new records to in-memory master_df ---\n        if not master_df.empty:\n            master_df = pd.concat([master_df, df_to_write_to_sheets.reindex(columns=master_df.columns)], ignore_index=True)\n        else: # master_df was empty, so it becomes the new records\n            master_df = df_to_write_to_sheets.reindex(columns=ALL_FINAL_COLUMNS).copy()\n        \n        # Ensure dtypes after concat, especially for 'fecha_publicado' and 'title_N'\n        if 'fecha_publicado' in master_df.columns:\n            master_df['fecha_publicado'] = pd.to_datetime(master_df['fecha_publicado'], errors='coerce')\n        if 'title_N' in master_df.columns:\n            master_df['title_N'] = pd.to_numeric(master_df['title_N'], errors='coerce').fillna(0).astype(int)\n        # Fill NaNs for AI and other string columns that might have been introduced\n        for col_fill in ALL_FINAL_COLUMNS:\n            if col_fill in ['riesgo', 'risk_explanation', 'resumen_IA']:\n                 master_df[col_fill] = master_df[col_fill].astype(str).fillna(\"Not generated\")\n            elif col_fill not in ['fecha_publicado', 'title_N']: # Already handled\n                 master_df[col_fill] = master_df[col_fill].astype(str).fillna(\"\")\n\n        print(f\"In-memory master_df updated with new records. Total rows: {len(master_df)}\")\n    else:\n        print(\"No new records to add to Google Sheets.\")\n\n    # --- AI Analysis Section (operates on the consolidated master_df) ---\n    if not GEMINI_API_KEY or model is None: \n        print(\"\\nGemini API not configured. Skipping AI analysis.\")\n    else:\n        print(\"\\nStarting AI Analysis on records in master_df...\")\n        # Ensure AI columns exist and are properly typed string, fill \"Not generated\" if empty\n        for col_ai in ['riesgo', 'risk_explanation', 'resumen_IA']:\n            if col_ai not in master_df.columns: master_df[col_ai] = \"Not generated\"\n            else: master_df[col_ai] = master_df[col_ai].astype(str).fillna(\"Not generated\").replace('', \"Not generated\")\n        \n        if 'pdf_link_direct' not in master_df.columns: master_df['pdf_link_direct'] = \"\"\n        else: master_df['pdf_link_direct'] = master_df['pdf_link_direct'].astype(str).fillna(\"\")\n\n        if 'fecha_publicado' not in master_df.columns: # Should not happen if ALL_FINAL_COLUMNS is right\n             master_df['fecha_publicado'] = pd.NaT \n        master_df['fecha_publicado'] = pd.to_datetime(master_df['fecha_publicado'], errors='coerce')\n\n\n        processed_for_ai_count = 0\n        # Identify records needing AI processing\n        # Condition: Any AI field is \"Not generated\" AND record is not too old AND has a valid PDF link\n        \n        # Create a boolean Series for each condition\n        needs_riesgo = master_df['riesgo'].astype(str).str.strip().fillna(\"\").str.lower() == \"not generated\"\n        needs_explanation = master_df['risk_explanation'].astype(str).str.strip().fillna(\"\").str.lower() == \"not generated\"\n        needs_summary = master_df['resumen_IA'].astype(str).str.strip().fillna(\"\").str.lower() == \"not generated\"\n        \n        record_needs_ai_processing = needs_riesgo | needs_explanation | needs_summary\n        \n        indices_to_process_ai = master_df[record_needs_ai_processing].index\n        print(f\"Found {len(indices_to_process_ai)} records potentially needing AI analysis based on 'Not generated' fields.\")\n\n        for index_loop in indices_to_process_ai: # Iterate over indices\n            row_loop = master_df.loc[index_loop]\n            doc_title_loop = str(row_loop.get('titulo', 'N/A'))\n            actual_pdf_to_process = str(row_loop.get('pdf_link_direct', '')).strip()\n            publish_date_loop = row_loop.get('fecha_publicado') # Should be datetime or NaT\n\n            # Validate date and cutoff\n            if pd.isna(publish_date_loop):\n                if master_df.loc[index_loop, 'riesgo'] == \"Not generated\": master_df.loc[index_loop, 'riesgo'] = \"Not processed (Missing Date)\"\n                if master_df.loc[index_loop, 'risk_explanation'] == \"Not generated\": master_df.loc[index_loop, 'risk_explanation'] = \"Not processed (Missing Date)\"\n                if master_df.loc[index_loop, 'resumen_IA'] == \"Not generated\": master_df.loc[index_loop, 'resumen_IA'] = \"Not processed (Missing Date)\"\n                continue \n            \n            if not isinstance(publish_date_loop, (datetime, pd.Timestamp)): # Should be, but double check\n                 try: publish_date_loop = pd.to_datetime(publish_date_loop)\n                 except: # If still not convertible\n                    if master_df.loc[index_loop, 'riesgo'] == \"Not generated\": master_df.loc[index_loop, 'riesgo'] = \"Not processed (Bad Date)\"\n                    # ... (update other AI fields similarly)\n                    continue\n\n            if publish_date_loop < GEMINI_PROCESSING_CUTOFF_DATE:\n                if master_df.loc[index_loop, 'riesgo'] == \"Not generated\": master_df.loc[index_loop, 'riesgo'] = \"Not processed (Old)\"\n                if master_df.loc[index_loop, 'risk_explanation'] == \"Not generated\": master_df.loc[index_loop, 'risk_explanation'] = \"Not processed (Old)\"\n                if master_df.loc[index_loop, 'resumen_IA'] == \"Not generated\": master_df.loc[index_loop, 'resumen_IA'] = \"Not processed (Old)\"\n                continue\n\n            print(f\"\\nProcessing AI for Master Idx {index_loop} (Title: {doc_title_loop}, Date: {publish_date_loop.strftime('%Y-%m-%d') if pd.notna(publish_date_loop) else 'N/A'})\")\n            print(f\"  Direct PDF: '{actual_pdf_to_process}'\")\n\n            if not actual_pdf_to_process or not actual_pdf_to_process.lower().startswith('http'):\n                print(f\"    Invalid or missing direct PDF link ('{actual_pdf_to_process}').\")\n                if master_df.loc[index_loop, 'riesgo'] == \"Not generated\": master_df.loc[index_loop, 'riesgo'] = \"Invalid Direct PDF Link\"\n                if master_df.loc[index_loop, 'risk_explanation'] == \"Not generated\": master_df.loc[index_loop, 'risk_explanation'] = \"Invalid Direct PDF Link\"\n                if master_df.loc[index_loop, 'resumen_IA'] == \"Not generated\": master_df.loc[index_loop, 'resumen_IA'] = \"Invalid Direct PDF Link\"\n                continue\n            \n            document_text = None\n            print(f\"    Attempting text extraction with PyMuPDF (fitz) for '{actual_pdf_to_process}'...\")\n            document_text = extract_text_from_pdf_fitz(actual_pdf_to_process)\n            \n            if not document_text:\n                print(f\"    PyMuPDF (fitz) failed or no text. Attempting OCRmyPDF fallback for '{actual_pdf_to_process}'...\")\n                document_text = extract_text_from_pdf_ocred(actual_pdf_to_process, lang_code='spa') # Using updated function\n                if document_text: print(\"    OCRmyPDF fallback extracted text.\")\n                else: print(\"    OCRmyPDF fallback also failed or no text.\")\n\n            if not document_text:\n                print(f\"    OCRmyPDF failed. Attempting PyTesseract fallback for '{actual_pdf_to_process}'...\")\n                try:\n                    pytesseract.get_tesseract_version() \n                    document_text = extract_text_from_pdf_ocr(actual_pdf_to_process, lang_code='spa')\n                    if document_text: print(\"    PyTesseract fallback extracted text.\")\n                    else: print(\"    PyTesseract fallback also failed or no text.\")\n                except Exception as e_tess: # Catches if Tesseract is not found or other errors\n                    print(f\"    PyTesseract fallback skipped/failed: {e_tess}\")\n\n            if document_text:\n                print(f\"    Extracted text (length {len(document_text)}). Requesting Gemini analysis...\")\n                riesgo_val, expl_val, summary_val = get_gemini_analysis(document_text)\n                \n                # Update only if \"Not generated\" to preserve prior error states or manual entries\n                if master_df.loc[index_loop, 'riesgo'] == \"Not generated\": master_df.loc[index_loop, 'riesgo'] = riesgo_val\n                if master_df.loc[index_loop, 'risk_explanation'] == \"Not generated\": master_df.loc[index_loop, 'risk_explanation'] = expl_val\n                if master_df.loc[index_loop, 'resumen_IA'] == \"Not generated\": master_df.loc[index_loop, 'resumen_IA'] = summary_val\n                \n                print(f\"      Gemini Results -> Risk: {master_df.loc[index_loop, 'riesgo']}, Expl: {master_df.loc[index_loop, 'risk_explanation'][:50]}..., SumIA: {master_df.loc[index_loop, 'resumen_IA'][:50]}...\")\n                processed_for_ai_count +=1\n            else:\n                print(f\"    Failed all text extraction methods for '{actual_pdf_to_process}'.\")\n                if master_df.loc[index_loop, 'riesgo'] == \"Not generated\": master_df.loc[index_loop, 'riesgo'] = \"PDF Text Extraction Failed\"\n                if master_df.loc[index_loop, 'risk_explanation'] == \"Not generated\": master_df.loc[index_loop, 'risk_explanation'] = \"PDF Text Extraction Failed\"\n                if master_df.loc[index_loop, 'resumen_IA'] == \"Not generated\": master_df.loc[index_loop, 'resumen_IA'] = \"PDF Text Extraction Failed\"\n            \n            if processed_for_ai_count > 0 and processed_for_ai_count % 3 == 0 : # Pause every 3 successful AI calls\n                print(\"    Pausing for 5s after 3 AI calls...\"); time.sleep(5)\n        \n        print(f\"\\nAI processing attempts finished. {processed_for_ai_count} records sent to Gemini.\")\n\n    # --- Final Update to Master Google Sheet ---\n    if master_worksheet and not master_df.empty: # Check if master_df has content\n        print(f\"\\nUpdating master Google Sheet '{MASTER_SHEET_NAME}' with {len(master_df)} records...\")\n        try:\n            # Ensure master_df has all columns in the right order for the sheet\n            final_df_for_master_sheet = master_df.reindex(columns=ALL_FINAL_COLUMNS).copy()\n            # Convert datetime to ISO string for gspread\n            for col_dt_master in final_df_for_master_sheet.select_dtypes(include=['datetime64[ns]', 'datetime.date', 'datetime.datetime']).columns:\n                final_df_for_master_sheet[col_dt_master] = final_df_for_master_sheet[col_dt_master].apply(lambda x: x.isoformat() if pd.notnull(x) and hasattr(x, 'isoformat') else \"\")\n            final_df_for_master_sheet = final_df_for_master_sheet.fillna('') # Fill all NaNs with empty string\n\n            set_with_dataframe(master_worksheet, final_df_for_master_sheet, include_index=False, resize=True)\n            print(f\"Master Google Sheet '{MASTER_SHEET_NAME}' updated successfully.\")\n        except Exception as e_master_upd:\n            print(f\"Error updating master Google Sheet '{MASTER_SHEET_NAME}': {e_master_upd}\")\n    elif not master_df.empty:\n         print(f\"\\nMaster Google Sheet '{MASTER_SHEET_NAME}' was not found or could not be created. Skipping final update for {len(master_df)} records.\")\n    else:\n        print(\"\\nNo data in master_df to update Google Sheet with.\")\n\n\n    print(\"\\nScript finished at:\", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))\n\nif __name__ == '__main__':\n    main()","metadata":{"_uuid":"aa9a245b-2b93-4e98-b8b3-c159cdfb45f1","_cell_guid":"48471c88-3752-4522-9897-ffcb722e0c6a","trusted":true,"collapsed":false,"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-06-01T00:30:46.013810Z","iopub.execute_input":"2025-06-01T00:30:46.014463Z","iopub.status.idle":"2025-06-01T00:32:59.638227Z","shell.execute_reply.started":"2025-06-01T00:30:46.014430Z","shell.execute_reply":"2025-06-01T00:32:59.636938Z"}},"outputs":[{"name":"stdout","text":"--- Starting system-level installations (apt-get) ---\nHit:1 http://security.ubuntu.com/ubuntu jammy-security InRelease\nHit:2 https://cloud.r-project.org/bin/linux/ubuntu jammy-cran40/ InRelease                          \nHit:3 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease         \nHit:4 https://r2u.stat.illinois.edu/ubuntu jammy InRelease                                          \nHit:5 http://archive.ubuntu.com/ubuntu jammy InRelease                                              \nHit:6 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy InRelease     \nHit:7 https://ppa.launchpadcontent.net/graphics-drivers/ppa/ubuntu jammy InRelease\nHit:8 https://ppa.launchpadcontent.net/ubuntugis/ppa/ubuntu jammy InRelease\nHit:9 http://archive.ubuntu.com/ubuntu jammy-updates InRelease\nHit:10 http://archive.ubuntu.com/ubuntu jammy-backports InRelease\nReading package lists... Done\nW: Skipping acquire of configured file 'main/source/Sources' as repository 'https://r2u.stat.illinois.edu/ubuntu jammy InRelease' does not seem to provide it (sources.list entry misspelt?)\nReading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\nPackage firefox-esr is not available, but is referred to by another package.\nThis may mean that the package is missing, has been obsoleted, or\nis only available from another source\n\nE: Package 'firefox-esr' has no installation candidate\n--- Finished system-level installations ---\n\n--- Starting Python library installations (pip) ---\nRequirement already satisfied: pip in /usr/local/lib/python3.11/dist-packages (25.1.1)\nRequirement already satisfied: sickle in /usr/local/lib/python3.11/dist-packages (0.7.0)\nRequirement already satisfied: oaipmh-scythe in /usr/local/lib/python3.11/dist-packages (0.13.0)\nRequirement already satisfied: dateparser in /usr/local/lib/python3.11/dist-packages (1.2.1)\nRequirement already satisfied: python-dateutil in /usr/local/lib/python3.11/dist-packages (2.9.0.post0)\nRequirement already satisfied: gspread in /usr/local/lib/python3.11/dist-packages (6.2.0)\nRequirement already satisfied: gspread_dataframe in /usr/local/lib/python3.11/dist-packages (4.0.0)\nRequirement already satisfied: google-api-python-client in /usr/local/lib/python3.11/dist-packages (2.164.0)\nRequirement already satisfied: google-generativeai in /usr/local/lib/python3.11/dist-packages (0.8.4)\nRequirement already satisfied: requests in /usr/local/lib/python3.11/dist-packages (2.32.3)\nRequirement already satisfied: pdfplumber in /usr/local/lib/python3.11/dist-packages (0.11.6)\nRequirement already satisfied: pymupdf in /usr/local/lib/python3.11/dist-packages (1.26.0)\nRequirement already satisfied: ocrmypdf in /usr/local/lib/python3.11/dist-packages (16.10.2)\nRequirement already satisfied: selenium in /usr/local/lib/python3.11/dist-packages (4.33.0)\nRequirement already satisfied: beautifulsoup4 in /usr/local/lib/python3.11/dist-packages (4.13.3)\nRequirement already satisfied: pytesseract in /usr/local/lib/python3.11/dist-packages (0.3.13)\nRequirement already satisfied: Pillow in /usr/local/lib/python3.11/dist-packages (11.1.0)\nRequirement already satisfied: python-dotenv in /usr/local/lib/python3.11/dist-packages (1.1.0)\nRequirement already satisfied: lxml>=3.2.3 in /usr/local/lib/python3.11/dist-packages (from sickle) (5.3.1)\nRequirement already satisfied: httpx>=0.25 in /usr/local/lib/python3.11/dist-packages (from oaipmh-scythe) (0.28.1)\nRequirement already satisfied: pytz>=2024.2 in /usr/local/lib/python3.11/dist-packages (from dateparser) (2025.2)\nRequirement already satisfied: regex!=2019.02.19,!=2021.8.27,>=2015.06.24 in /usr/local/lib/python3.11/dist-packages (from dateparser) (2024.11.6)\nRequirement already satisfied: tzlocal>=0.2 in /usr/local/lib/python3.11/dist-packages (from dateparser) (5.3.1)\nRequirement already satisfied: six>=1.5 in /usr/local/lib/python3.11/dist-packages (from python-dateutil) (1.17.0)\nRequirement already satisfied: google-auth>=1.12.0 in /usr/local/lib/python3.11/dist-packages (from gspread) (2.40.1)\nRequirement already satisfied: google-auth-oauthlib>=0.4.1 in /usr/local/lib/python3.11/dist-packages (from gspread) (1.2.1)\nRequirement already satisfied: pandas>=0.24.0 in /usr/local/lib/python3.11/dist-packages (from gspread_dataframe) (2.2.3)\nRequirement already satisfied: httplib2<1.dev0,>=0.19.0 in /usr/local/lib/python3.11/dist-packages (from google-api-python-client) (0.22.0)\nRequirement already satisfied: google-auth-httplib2<1.0.0,>=0.2.0 in /usr/local/lib/python3.11/dist-packages (from google-api-python-client) (0.2.0)\nRequirement already satisfied: google-api-core!=2.0.*,!=2.1.*,!=2.2.*,!=2.3.0,<3.0.0.dev0,>=1.31.5 in /usr/local/lib/python3.11/dist-packages (from google-api-python-client) (1.34.1)\nRequirement already satisfied: uritemplate<5,>=3.0.1 in /usr/local/lib/python3.11/dist-packages (from google-api-python-client) (4.1.1)\nRequirement already satisfied: googleapis-common-protos<2.0dev,>=1.56.2 in /usr/local/lib/python3.11/dist-packages (from google-api-core!=2.0.*,!=2.1.*,!=2.2.*,!=2.3.0,<3.0.0.dev0,>=1.31.5->google-api-python-client) (1.70.0)\nRequirement already satisfied: protobuf!=3.20.0,!=3.20.1,!=4.21.0,!=4.21.1,!=4.21.2,!=4.21.3,!=4.21.4,!=4.21.5,<4.0.0dev,>=3.19.5 in /usr/local/lib/python3.11/dist-packages (from google-api-core!=2.0.*,!=2.1.*,!=2.2.*,!=2.3.0,<3.0.0.dev0,>=1.31.5->google-api-python-client) (3.20.3)\nRequirement already satisfied: charset-normalizer<4,>=2 in /usr/local/lib/python3.11/dist-packages (from requests) (3.4.2)\nRequirement already satisfied: idna<4,>=2.5 in /usr/local/lib/python3.11/dist-packages (from requests) (3.10)\nRequirement already satisfied: urllib3<3,>=1.21.1 in /usr/local/lib/python3.11/dist-packages (from requests) (2.4.0)\nRequirement already satisfied: certifi>=2017.4.17 in /usr/local/lib/python3.11/dist-packages (from requests) (2025.4.26)\nRequirement already satisfied: cachetools<6.0,>=2.0.0 in /usr/local/lib/python3.11/dist-packages (from google-auth>=1.12.0->gspread) (5.5.2)\nRequirement already satisfied: pyasn1-modules>=0.2.1 in /usr/local/lib/python3.11/dist-packages (from google-auth>=1.12.0->gspread) (0.4.2)\nRequirement already satisfied: rsa<5,>=3.1.4 in /usr/local/lib/python3.11/dist-packages (from google-auth>=1.12.0->gspread) (4.9.1)\nRequirement already satisfied: pyparsing!=3.0.0,!=3.0.1,!=3.0.2,!=3.0.3,<4,>=2.4.2 in /usr/local/lib/python3.11/dist-packages (from httplib2<1.dev0,>=0.19.0->google-api-python-client) (3.0.9)\nRequirement already satisfied: pyasn1>=0.1.3 in /usr/local/lib/python3.11/dist-packages (from rsa<5,>=3.1.4->google-auth>=1.12.0->gspread) (0.6.1)\nRequirement already satisfied: google-ai-generativelanguage==0.6.15 in /usr/local/lib/python3.11/dist-packages (from google-generativeai) (0.6.15)\nRequirement already satisfied: pydantic in /usr/local/lib/python3.11/dist-packages (from google-generativeai) (2.11.4)\nRequirement already satisfied: tqdm in /usr/local/lib/python3.11/dist-packages (from google-generativeai) (4.67.1)\nRequirement already satisfied: typing-extensions in /usr/local/lib/python3.11/dist-packages (from google-generativeai) (4.13.2)\nRequirement already satisfied: proto-plus<2.0.0dev,>=1.22.3 in /usr/local/lib/python3.11/dist-packages (from google-ai-generativelanguage==0.6.15->google-generativeai) (1.26.1)\nRequirement already satisfied: grpcio<2.0dev,>=1.33.2 in /usr/local/lib/python3.11/dist-packages (from google-api-core[grpc]!=2.0.*,!=2.1.*,!=2.10.*,!=2.2.*,!=2.3.*,!=2.4.*,!=2.5.*,!=2.6.*,!=2.7.*,!=2.8.*,!=2.9.*,<3.0.0dev,>=1.34.1->google-ai-generativelanguage==0.6.15->google-generativeai) (1.72.0rc1)\nRequirement already satisfied: grpcio-status<2.0dev,>=1.33.2 in /usr/local/lib/python3.11/dist-packages (from google-api-core[grpc]!=2.0.*,!=2.1.*,!=2.10.*,!=2.2.*,!=2.3.*,!=2.4.*,!=2.5.*,!=2.6.*,!=2.7.*,!=2.8.*,!=2.9.*,<3.0.0dev,>=1.34.1->google-ai-generativelanguage==0.6.15->google-generativeai) (1.49.0rc1)\nRequirement already satisfied: pdfminer.six==20250327 in /usr/local/lib/python3.11/dist-packages (from pdfplumber) (20250327)\nRequirement already satisfied: pypdfium2>=4.18.0 in /usr/local/lib/python3.11/dist-packages (from pdfplumber) (4.30.1)\nRequirement already satisfied: cryptography>=36.0.0 in /usr/local/lib/python3.11/dist-packages (from pdfminer.six==20250327->pdfplumber) (44.0.3)\nRequirement already satisfied: deprecation>=2.1.0 in /usr/local/lib/python3.11/dist-packages (from ocrmypdf) (2.1.0)\nRequirement already satisfied: img2pdf>=0.5 in /usr/local/lib/python3.11/dist-packages (from ocrmypdf) (0.6.1)\nRequirement already satisfied: packaging>=20 in /usr/local/lib/python3.11/dist-packages (from ocrmypdf) (25.0)\nRequirement already satisfied: pi-heif in /usr/local/lib/python3.11/dist-packages (from ocrmypdf) (0.22.0)\nRequirement already satisfied: pikepdf!=9.8.0,>=8.10.1 in /usr/local/lib/python3.11/dist-packages (from ocrmypdf) (9.8.1)\nRequirement already satisfied: pluggy>=1 in /usr/local/lib/python3.11/dist-packages (from ocrmypdf) (1.5.0)\nRequirement already satisfied: rich>=13 in /usr/local/lib/python3.11/dist-packages (from ocrmypdf) (14.0.0)\nRequirement already satisfied: trio~=0.30.0 in /usr/local/lib/python3.11/dist-packages (from selenium) (0.30.0)\nRequirement already satisfied: trio-websocket~=0.12.2 in /usr/local/lib/python3.11/dist-packages (from selenium) (0.12.2)\nRequirement already satisfied: websocket-client~=1.8.0 in /usr/local/lib/python3.11/dist-packages (from selenium) (1.8.0)\nRequirement already satisfied: attrs>=23.2.0 in /usr/local/lib/python3.11/dist-packages (from trio~=0.30.0->selenium) (25.3.0)\nRequirement already satisfied: sortedcontainers in /usr/local/lib/python3.11/dist-packages (from trio~=0.30.0->selenium) (2.4.0)\nRequirement already satisfied: outcome in /usr/local/lib/python3.11/dist-packages (from trio~=0.30.0->selenium) (1.3.0.post0)\nRequirement already satisfied: sniffio>=1.3.0 in /usr/local/lib/python3.11/dist-packages (from trio~=0.30.0->selenium) (1.3.1)\nRequirement already satisfied: wsproto>=0.14 in /usr/local/lib/python3.11/dist-packages (from trio-websocket~=0.12.2->selenium) (1.2.0)\nRequirement already satisfied: pysocks!=1.5.7,<2.0,>=1.5.6 in /usr/local/lib/python3.11/dist-packages (from urllib3[socks]~=2.4.0->selenium) (1.7.1)\nRequirement already satisfied: soupsieve>1.2 in /usr/local/lib/python3.11/dist-packages (from beautifulsoup4) (2.6)\nRequirement already satisfied: cffi>=1.12 in /usr/local/lib/python3.11/dist-packages (from cryptography>=36.0.0->pdfminer.six==20250327->pdfplumber) (1.17.1)\nRequirement already satisfied: pycparser in /usr/local/lib/python3.11/dist-packages (from cffi>=1.12->cryptography>=36.0.0->pdfminer.six==20250327->pdfplumber) (2.22)\nRequirement already satisfied: requests-oauthlib>=0.7.0 in /usr/local/lib/python3.11/dist-packages (from google-auth-oauthlib>=0.4.1->gspread) (2.0.0)\nRequirement already satisfied: anyio in /usr/local/lib/python3.11/dist-packages (from httpx>=0.25->oaipmh-scythe) (4.9.0)\nRequirement already satisfied: httpcore==1.* in /usr/local/lib/python3.11/dist-packages (from httpx>=0.25->oaipmh-scythe) (1.0.7)\nRequirement already satisfied: h11<0.15,>=0.13 in /usr/local/lib/python3.11/dist-packages (from httpcore==1.*->httpx>=0.25->oaipmh-scythe) (0.14.0)\nRequirement already satisfied: numpy>=1.23.2 in /usr/local/lib/python3.11/dist-packages (from pandas>=0.24.0->gspread_dataframe) (1.26.4)\nRequirement already satisfied: tzdata>=2022.7 in /usr/local/lib/python3.11/dist-packages (from pandas>=0.24.0->gspread_dataframe) (2025.2)\nRequirement already satisfied: mkl_fft in /usr/local/lib/python3.11/dist-packages (from numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (1.3.8)\nRequirement already satisfied: mkl_random in /usr/local/lib/python3.11/dist-packages (from numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (1.2.4)\nRequirement already satisfied: mkl_umath in /usr/local/lib/python3.11/dist-packages (from numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (0.1.1)\nRequirement already satisfied: mkl in /usr/local/lib/python3.11/dist-packages (from numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (2025.1.0)\nRequirement already satisfied: tbb4py in /usr/local/lib/python3.11/dist-packages (from numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (2022.1.0)\nRequirement already satisfied: mkl-service in /usr/local/lib/python3.11/dist-packages (from numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (2.4.1)\nRequirement already satisfied: Deprecated in /usr/local/lib/python3.11/dist-packages (from pikepdf!=9.8.0,>=8.10.1->ocrmypdf) (1.2.18)\nRequirement already satisfied: oauthlib>=3.0.0 in /usr/local/lib/python3.11/dist-packages (from requests-oauthlib>=0.7.0->google-auth-oauthlib>=0.4.1->gspread) (3.2.2)\nRequirement already satisfied: markdown-it-py>=2.2.0 in /usr/local/lib/python3.11/dist-packages (from rich>=13->ocrmypdf) (3.0.0)\nRequirement already satisfied: pygments<3.0.0,>=2.13.0 in /usr/local/lib/python3.11/dist-packages (from rich>=13->ocrmypdf) (2.19.1)\nRequirement already satisfied: mdurl~=0.1 in /usr/local/lib/python3.11/dist-packages (from markdown-it-py>=2.2.0->rich>=13->ocrmypdf) (0.1.2)\nRequirement already satisfied: wrapt<2,>=1.10 in /usr/local/lib/python3.11/dist-packages (from Deprecated->pikepdf!=9.8.0,>=8.10.1->ocrmypdf) (1.17.2)\nRequirement already satisfied: intel-openmp<2026,>=2024 in /usr/local/lib/python3.11/dist-packages (from mkl->numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (2024.2.0)\nRequirement already satisfied: tbb==2022.* in /usr/local/lib/python3.11/dist-packages (from mkl->numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (2022.1.0)\nRequirement already satisfied: intel-cmplr-lib-ur==2024.2.0 in /usr/local/lib/python3.11/dist-packages (from intel-openmp<2026,>=2024->mkl->numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (2024.2.0)\nRequirement already satisfied: tcmlib==1.* in /usr/local/lib/python3.11/dist-packages (from tbb==2022.*->mkl->numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (1.3.0)\nRequirement already satisfied: intel-cmplr-lib-rt in /usr/local/lib/python3.11/dist-packages (from mkl_umath->numpy>=1.23.2->pandas>=0.24.0->gspread_dataframe) (2024.2.0)\nRequirement already satisfied: annotated-types>=0.6.0 in /usr/local/lib/python3.11/dist-packages (from pydantic->google-generativeai) (0.7.0)\nRequirement already satisfied: pydantic-core==2.33.2 in /usr/local/lib/python3.11/dist-packages (from pydantic->google-generativeai) (2.33.2)\nRequirement already satisfied: typing-inspection>=0.4.0 in /usr/local/lib/python3.11/dist-packages (from pydantic->google-generativeai) (0.4.0)\n--- Finished Python library installations ---\n\nScript to request records from LANAMME's repository and update our data with AI analysis\n\nImporting Python libraries...\nAll necessary Python libraries imported.\n\nMain variables setup\nKaggle: Loading secrets.\nKaggle secrets loaded.\nGemini model 'gemini-1.5-pro-latest' initialized for JSON.\nScript started at: 2025-06-01 00:30:58\nConnecting to DSpace repository and requesting records...\nError retrieving data from DSpace: timed out\nNo DSpace data obtained or DSpace error. Exiting.\n","output_type":"stream"}],"execution_count":3}]}
+# %% [code]
+# %% [code]
+# %% [code]
+# %% [code]
+# coding: utf-8
+
+# # Procesamiento informes
+
+# ## Instalaciones
+
+# Tardará un poco pues son pesadas
+
+import os
+
+os.system('pip install -U pip')
+
+os.system('pip install sickle')
+
+os.system('pip install scythe')
+
+os.system('pip install oaipmh-scythe')
+
+os.system('pip install dateparser')
+
+os.system('pip install openpyxl')
+
+os.system('pip install python-dateutil')
+
+os.system('pip install python-dotenv')
+
+os.system('pip install gspread')
+
+os.system('pip install gspread-pandas')
+
+os.system('pip install gspread_dataframe')
+
+os.system('pip install google-api-python-client')
+
+os.system('pip install keyring')
+
+
+os.system('pip install selenium')
+
+# # os.system('pip install --upgrade nbconvert')
+
+# ## Instalar librerías para Gemini y procesar PDF
+
+os.system('pip install google-generativeai')
+
+os.system('pip install requests')
+
+os.system('pip install pdfplumber')
+
+os.system('pip install pymupdf')
+
+os.system('pip install ocrmypdf')
+
+os.system('pip install pytesseract Pillow') # For OCR
+
+# # Procesamiento informes LANAMME desde repositorio
+# # Wilmer Ramirez Morera
+# # wilmer.ramirez@gmail.com
+# # wilmer.ramirez@cgr.go.cr
+
+print(f"\n{'*'*72}\nScript to request records from LANAMME's repository and update our data\n{'*'*72}\n")
+
+# ## -------- Importaciones --------
+
+import datetime as dt
+
+import os
+import unicodedata
+import pandas as pd
+# from google.colab import drive
+from ctypes.util import find_library
+# import pdfminer
+# from pdfminer.high_level import extract_text
+# import spacy
+# import es_core_news_mdz
+# import es_core_news_lg
+
+from pandas.core.dtypes.inference import is_number
+from pandas.core.dtypes.common import is_numeric_v_string_like
+from pdfminer.utils import isnumber
+
+import numpy as np
+import re
+import time # For potential delays between API calls
+
+from datetime import datetime
+import json
+
+os.getcwd()
+
+os.chdir("../")
+
+os.getcwd()
+
+# ### OAI-PHM
+
+from sickle import Sickle
+
+from oaipmh_scythe import Scythe
+
+from pprint import pprint
+
+# ### Google Sheets
+
+import gspread
+
+try:
+    from gspread_dataframe import set_with_dataframe, get_as_dataframe
+except ImportError:
+    os.system('pip install gspread_dataframe')
+    from gspread_dataframe import set_with_dataframe, get_as_dataframe
+
+# ### Kaggle or local
+
+if os.environ.get('KAGGLE_KERNEL_RUN_TYPE') in ('Interactive', 'Batch'):
+    from kaggle_secrets import UserSecretsClient
+else:
+    from dotenv import load_dotenv, find_dotenv
+    _ = load_dotenv(find_dotenv()) # read local .env file
+
+# ### Gemini API
+
+import google.generativeai as genai
+
+# ### PDF Processing
+
+import requests
+import pdfplumber
+from io import BytesIO
+import fitz
+import ocrmypdf
+
+import urllib.request
+import urllib.error
+from urllib.parse import urljoin # Already there, but ensure it's available
+import traceback # For detailed error logging
+
+import pytesseract # For OCR
+from PIL import Image # For OCR with Tesseract
+
+# ### Web scrapping
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, ElementNotInteractableException
+
+from bs4 import BeautifulSoup
+
+# ---
+
+# ## -------- CONFIGURATION -------- 
+
+# ### DSpace URL
+
+URL = 'https://www.lanamme.ucr.ac.cr/oai/request?'
+
+# ### DSpace date constraint
+
+DSpace_start='2024-01-01'
+
+# ### Google Sheets - Master sheet name
+
+MASTER_SHEET_NAME = 'Master' 
+
+# ### risk categories
+
+RISK_CATEGORIES = ["ninguno", "bajo", "medio", "alto", "critico"] # Define globally for validation
+
+# ### Gemini date constraint
+
+GEMINI_PROCESSING_CUTOFF_DATE = datetime(2024, 1, 1) 
+
+# ### Gemini specification model
+
+GEMINI_MODEL_NAME = 'gemini-2.5-flash-preview-05-20' # Or your preferred model
+
+# GEMINI_MODEL_NAME = 'gemini-2.5-pro-preview-03-25' # Or your preferred model
+
+# GEMINI_MODEL_NAME = 'gemini-2.5-pro-exp-03-25' # Or your preferred model
+
+# ### Secrets, API keys
+
+if os.environ.get('KAGGLE_KERNEL_RUN_TYPE') in ('Interactive', 'Batch'):
+    user_secrets = UserSecretsClient()
+    try:
+        GEMINI_API_KEY = user_secrets.get_secret("GEMINI_API_KEY") # Store your Gemini API Key as a Kaggle Secret
+        GOOGLE_API_SECRET = user_secrets.get_secret("Google_API")
+        GOOGLE_SHEET_ID = user_secrets.get_secret("NewSheetID")
+    except Exception as e:
+        print(f"Error accessing Kaggle Secrets: {e}")
+        print("Please ensure GEMINI_API_KEY, Google_API, and SheetID are set in Kaggle Secrets.")
+        GEMINI_API_KEY = None # Or handle as a fatal error
+        GOOGLE_API_SECRET = None
+        GOOGLE_SHEET_ID = None
+else:
+    try:
+        GEMINI_API_KEY = os.environ["GEMINI_API_KEY"] # Store your Gemini API Key as a Kaggle Secret
+        GOOGLE_API_SECRET = os.environ["Google_API"]
+        GOOGLE_SHEET_ID = os.environ["NewSheetID"]
+    except Exception as e:
+        print(f"Error accessing Local Secrets: {e}")
+        print("Please ensure GEMINI_API_KEY, Google_API, and SheetID are set in Kaggle Secrets.")
+        GEMINI_API_KEY = None # Or handle as a fatal error
+        GOOGLE_API_SECRET = None
+        GOOGLE_SHEET_ID = None
+
+# ### Gemini Model
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY) 
+    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+else:
+    model = None
+    print("Gemini API Key not found. AI processing will be skipped.")
+
+# ### Checking gemini models
+
+def gemini_models(API_KEY=None):
+    if API_KEY: 
+        genai.configure(api_key=API_KEY)
+        print("Gemini API Key configured.")
+
+        print("\nAvailable models that support 'generateContent':")
+        model_found = False
+        for m in genai.list_models():
+            # We are interested in models that can generate text content
+            if 'generateContent' in m.supported_generation_methods:
+                print(f"  Model name: {m.name}")
+                print(f"    Display name: {m.display_name}")
+                print(f"    Description: {m.description}")
+                # You might also want to check m.version, etc.
+                print("-" * 20)
+                model_found = True
+
+        if not model_found:
+            print("No models found that support 'generateContent'. Check your API key and permissions.")
+
+    else:
+        print("GEMINI_API_KEY not found. Cannot list models.")
+    return
+
+# gemini_models(GEMINI_API_KEY)
+
+# ## -------- HELPER FUNCTIONS --------
+
+# ### enhanced request
+
+def fetch_pdf_bytes_with_urllib(initial_url, max_redirects_ignored=5, timeout=45): # max_redirects is handled by urlopen
+    current_url = initial_url
+    # Standard browser User-Agent
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+
+    try:
+        print(f"  urllib: Attempting to GET (with auto-redirects): {current_url}")
+        req = urllib.request.Request(current_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            # urlopen handles redirects by default.
+            # Get the final URL after all redirects were followed.
+            final_url = response.geturl()
+            print(f"  urllib: Final URL after redirects: {final_url}")
+            print(f"  urllib: Status code: {response.getcode()}")
+
+            # Check content type from the final response
+            info = response.info() # This is an http.client.HTTPMessage object
+            content_type = info.get('Content-Type', '').lower()
+
+            if 'application/pdf' not in content_type:
+                print(f"  urllib: ERROR - Content-Type is '{content_type}', not 'application/pdf'. Final URL: {final_url}")
+                return None
+
+            pdf_bytes = response.read()
+            print(f"  urllib: PDF downloaded successfully from {final_url}. Size: {len(pdf_bytes)} bytes.")
+            return pdf_bytes
+
+    except urllib.error.HTTPError as e:
+        # This catches 4xx, 5xx errors. 3xx should have been handled by urlopen.
+        # If a redirect chain itself leads to an error, it might surface here.
+        print(f"  urllib: HTTPError for '{current_url}': Code: {e.code}, Reason: {e.reason}")
+        if hasattr(e, 'headers'):
+            print(f"    Response Headers from error: {e.headers}")
+        return None
+    except urllib.error.URLError as e:
+        # This can be a timeout (socket.timeout is often wrapped here), connection error, DNS error, etc.
+        print(f"  urllib: URLError for '{current_url}': Reason: {e.reason}")
+        # Check if it's a timeout
+        if isinstance(e.reason, TimeoutError) or (hasattr(e.reason, 'errno') and e.reason.errno == 60): # errno 60 is ETIMEDOUT on some systems
+             print(f"  urllib: Explicit timeout detected for {current_url}")
+        return None
+    except TimeoutError: # Catch global TimeoutError as well, socket.timeout might raise this directly
+        print(f"  urllib: Global TimeoutError for {current_url}")
+        return None
+    except Exception as e_generic:
+        print(f"  urllib: Generic error for '{current_url}': {type(e_generic).__name__} - {e_generic}")
+        print(traceback.format_exc())
+        return None
+
+# ### Clean text for LLM
+
+def clean_text_for_llm(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+
+    # 1. Normalize Unicode characters
+    # NFKC is a good choice: applies compatibility decomposition, followed by canonical composition.
+    # It can help with ligatures and visually similar characters.
+    try:
+        text = unicodedata.normalize('NFKC', text)
+    except Exception as e:
+        print(f"Warning: Unicode normalization failed - {e}")
+        # Continue with the original text if normalization fails
+
+    # 2. Replace common problematic sequences or characters (optional, add as needed)
+    #    Example: Replace multiple spaces with a single space
+    text = re.sub(r'\s+', ' ', text)
+    #    Example: Remove specific known bad characters if you identify them
+    #    text = text.replace('\ufeff', '') # Remove BOM (Byte Order Mark) if it appears mid-string
+
+    # 3. Filter out most control characters but keep essential whitespace
+    cleaned_chars = []
+    for char in text:
+        # Get the Unicode category of the character
+        category = unicodedata.category(char)
+        # Keep letters, numbers, punctuation, symbols, and common whitespace (space, newline, tab)
+        if category.startswith('L') or \
+           category.startswith('N') or \
+           category.startswith('P') or \
+           category.startswith('S') or \
+           char in (' ', '\n', '\t', '\r'): # Explicitly keep common whitespace
+            cleaned_chars.append(char)
+        # Optionally, replace other control characters or unwanted categories with a space or remove them
+        # For example, to replace other control chars ('Cc', 'Cf', 'Co', 'Cs', 'Cn') with nothing:
+        # elif category.startswith('C'):
+        #     pass # Discard
+        # To replace with a space (be careful not to add too many spaces):
+        # elif category.startswith('C'):
+        #    if cleaned_chars and cleaned_chars[-1] != ' ': # Avoid double spaces
+        #        cleaned_chars.append(' ')
+
+    text = "".join(cleaned_chars)
+
+    # 4. Ensure the text is valid UTF-8 by encoding and decoding
+    # 'replace' will insert the U+FFFD (�) replacement character for any bytes
+    # that can't be decoded. 'ignore' would just drop them.
+    # This step primarily handles issues if the string somehow contains
+    # byte sequences that are not valid UTF-8, which can happen with OCR.
+    try:
+        text = text.encode('utf-8', 'replace').decode('utf-8')
+    except Exception as e:
+        print(f"Warning: UTF-8 encode/decode cleaning step failed - {e}")
+        # Fallback or decide how to handle, for now, use the text as is from previous steps
+
+    return text.strip()
+
+# ### Get pdf URL
+
+def get_pdf_url(url):
+
+    options = webdriver.FirefoxOptions()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    # options.add_argument("--window-size=1920,1080")
+
+    web=f"{url}?show=full"
+
+    browser = webdriver.Firefox(options=options)
+
+    if not url or not isinstance(url, str) or not url.startswith('http'):
+        print(f"    get_direct_pdf_url: Invalid page_url: '{url}'")
+        return None
+
+    browser.get(web)
+    time.sleep(250 / 1000)
+
+    html = browser.page_source
+    pagina = BeautifulSoup(html, 'html.parser')
+
+    pdf_url_tag = pagina.find('meta', {'name': 'citation_pdf_url'})
+    if pdf_url_tag:
+        pdf_url = pdf_url_tag['content']
+    else:
+        return None
+
+    browser.close()
+    browser.stop_client()
+
+    return pdf_url
+
+# ### Extract PDF
+
+# #### basic
+
+def extract_text_from_pdf_url(pdf_url):
+    """Fetches a PDF from a URL and extracts text content."""
+    if not pdf_url or not isinstance(pdf_url, str) or not pdf_url.lower().endswith('.pdf'):
+        print(f"Invalid or non-PDF URL: {pdf_url}")
+        return None
+    try:
+        response = requests.get(pdf_url, timeout=30) # Added timeout
+        response.raise_for_status()  # Raises an exception for bad status codes
+
+        text_content = ""
+        with BytesIO(response.content) as pdf_file:
+            with pdfplumber.open(pdf_file) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_content += page_text + "\n"
+        return text_content.strip() if text_content else None
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading PDF from {pdf_url}: {e}")
+    except Exception as e:
+        print(f"Error extracting text from PDF {pdf_url}: {e}")
+    return None
+
+# #### Fitz
+
+def extract_text_from_pdf_fitz(pdf_url_direct_initial):
+    if not pdf_url_direct_initial or not isinstance(pdf_url_direct_initial, str) or not pdf_url_direct_initial.lower().startswith('http'):
+        print(f"  Fitz: Error - Invalid URL format for PDF extraction: '{pdf_url_direct_initial}'")
+        return None
+
+    if not pdf_url_direct_initial.lower().endswith('.pdf'):
+        print(f"  Fitz: Warning - Direct PDF URL does not end with .pdf: '{pdf_url_direct_initial}'. Attempting download anyway.")
+
+    print(f"  Fitz: Attempting download via urllib for: {pdf_url_direct_initial}")
+    pdf_bytes = fetch_pdf_bytes_with_urllib(pdf_url_direct_initial, timeout=45) # Pass timeout
+
+    if not pdf_bytes:
+        print(f"  Fitz: Failed to download PDF bytes using urllib for {pdf_url_direct_initial}.")
+        return None
+
+    print(f"  Fitz: PDF bytes received ({len(pdf_bytes)} bytes). Processing with PyMuPDF...")
+    text_content = ""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        # print(f"  Fitz: Extracting text from {len(doc)} page(s)...") # Log is now in the fetcher
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            page_text = page.get_text("text")
+            if page_text:
+                text_content += page_text + "\n"
+        doc.close()
+        if text_content.strip():
+            print(f"  Fitz: Text extraction complete.")
+        else:
+            print(f"  Fitz: No text could be extracted (PDF might be image-based or empty of text).")
+        return text_content.strip() if text_content.strip() else None
+    except Exception as e_fitz_proc:
+        print(f"  Fitz: Error opening or parsing PDF content with PyMuPDF from '{pdf_url_direct_initial}': {e_fitz_proc}")
+        print(traceback.format_exc())
+        return None
+
+# #### pytesseract
+
+def extract_text_from_pdf_ocr(pdf_url_direct, lang_code='spa'):
+    if not pdf_url_direct or not isinstance(pdf_url_direct, str) or not pdf_url_direct.lower().startswith('http'):
+        print(f"  OCR (Pytesseract): Error - Invalid URL for PDF: '{pdf_url_direct}'")
+        return None
+
+    try:
+        print(f"  OCR (Pytesseract): Attempting download via urllib for OCR: {pdf_url_direct}")
+        # --- USE THE URLLIB FETCHER ---
+        pdf_bytes = fetch_pdf_bytes_with_urllib(pdf_url_direct, timeout=45)
+        # -----------------------------
+
+        if not pdf_bytes:
+            print(f"  OCR (Pytesseract): Failed to download PDF using urllib for '{pdf_url_direct}'.")
+            return None
+
+        print(f"  OCR (Pytesseract): PDF downloaded via urllib for OCR. Size: {len(pdf_bytes)} bytes.")
+        all_ocr_text = ""
+        doc = None
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            # ... (rest of your Pytesseract logic using doc.load_page, page.get_pixmap, Image.open, pytesseract.image_to_string) ...
+            print(f"  OCR (Pytesseract): Processing {len(doc)} pages with Tesseract (lang: {lang_code})...")
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(dpi=300) 
+                img_bytes_pil = pix.tobytes("png") # Changed variable name to avoid conflict with pdf_bytes
+
+                try:
+                    pil_image = Image.open(BytesIO(img_bytes_pil))
+                    page_ocr_text = pytesseract.image_to_string(pil_image, lang=lang_code)
+                    if page_ocr_text:
+                        all_ocr_text += page_ocr_text + "\n\n"
+                    print(f"    OCR (Pytesseract): Page {page_num + 1} processed.")
+                except Exception as e_ocr_page:
+                    print(f"    OCR (Pytesseract): Error processing page {page_num + 1} with Tesseract: {e_ocr_page}")
+            # ... (logging and return) ...
+            if all_ocr_text.strip():
+                print("  OCR (Pytesseract): Text extraction via OCR complete.")
+            else:
+                print("  OCR (Pytesseract): No text extracted via OCR.")
+            return all_ocr_text.strip() if all_ocr_text.strip() else None
+
+        except Exception as e_ocr_fitz_setup: # Error opening PDF with fitz before OCR
+            print(f"  OCR (Pytesseract): Error opening PDF with PyMuPDF for OCR preparation: {e_ocr_fitz_setup}")
+            print(traceback.format_exc())
+            return None
+        finally:
+            if doc:
+                doc.close()
+
+    except Exception as e_generic_download_setup: # Errors during download setup
+        print(f"OCR (Pytesseract): Generic error during download/setup for OCR: {type(e_generic_download_setup).__name__} - {e_generic_download_setup}")
+        print(traceback.format_exc())
+        return None
+
+# #### OCRmyPDF
+
+import tempfile # Make sure this is at the top of your script with other imports
+import os       # Make sure this is at the top of your script (it likely already is)
+
+def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
+    if not pdf_url_direct or not isinstance(pdf_url_direct, str) or not pdf_url_direct.lower().startswith('http'):
+        print(f"  OCRmyPDF: Error - Invalid URL format for PDF processing: '{pdf_url_direct}'")
+        return None
+
+    # Warning for non .pdf extension is fine to keep
+    if not pdf_url_direct.lower().endswith('.pdf'):
+        print(f"  OCRmyPDF: Warning - Direct PDF URL does not end with .pdf: '{pdf_url_direct}'. Attempting download anyway.")
+
+    input_pdf_path = None
+    output_pdf_path = None
+
+    try:
+        print(f"  OCRmyPDF: Attempting to download direct PDF via urllib from: {pdf_url_direct}")
+        # --- USE THE URLLIB FETCHER ---
+        pdf_bytes_original = fetch_pdf_bytes_with_urllib(pdf_url_direct, timeout=60)
+        # -----------------------------
+
+        if not pdf_bytes_original:
+            print(f"  OCRmyPDF: Failed to download PDF using urllib for '{pdf_url_direct}'.")
+            return None
+
+        print(f"  OCRmyPDF: PDF bytes downloaded via urllib. Size: {len(pdf_bytes_original)} bytes.")
+        text_content = ""
+
+        # Create a named temporary file for the input PDF
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_in:
+            input_pdf_path = tmp_in.name
+            tmp_in.write(pdf_bytes_original)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_out:
+            output_pdf_path = tmp_out.name
+
+        print(f"  OCRmyPDF: Input temp file: {input_pdf_path}")
+        print(f"  OCRmyPDF: Output temp file: {output_pdf_path}")
+
+        try:
+            ocrmypdf.ocr(input_pdf_path, output_pdf_path,
+                         language=lang_code, force_ocr=True, deskew=True,
+                         optimize=2, skip_text=False, invalidate_digital_signatures=True)
+            print(f"  OCRmyPDF: OCR process completed. Output saved to {output_pdf_path}")
+
+            doc = fitz.open(output_pdf_path)
+            # ... (rest of fitz text extraction from output_pdf_path) ...
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                page_text = page.get_text("text")
+                if page_text:
+                    text_content += page_text + "\n"
+            doc.close()
+            # ... (logging and return) ...
+            if text_content.strip():
+                print(f"  OCRmyPDF: Text extraction complete from OCR'd PDF file.")
+            else:
+                print(f"  OCRmyPDF: No text could be extracted from OCR'd PDF file.")
+            return text_content.strip() if text_content.strip() else None
+
+        except ocrmypdf.exceptions.InputFileError as e: # Specific ocrmypdf errors
+            print(f"  OCRmyPDF Input Error for '{pdf_url_direct}' (file {input_pdf_path}): {e}.")
+            return None
+        # ... (other specific ocrmypdf exceptions you had) ...
+        except Exception as e_ocrmypdf_process:
+            print(f"  OCRmyPDF: General error during OCR or text extraction for '{pdf_url_direct}': {type(e_ocrmypdf_process).__name__} - {e_ocrmypdf_process}")
+            print(traceback.format_exc()) # Add traceback for these errors too
+            return None
+
+    except Exception as e_generic_download_setup: # Errors during download setup or initial phases
+        print(f"OCRmyPDF: Generic error during download/setup for '{pdf_url_direct}': {type(e_generic_download_setup).__name__} - {e_generic_download_setup}")
+        print(traceback.format_exc()) # Add traceback
+        return None
+    finally:
+        if input_pdf_path and os.path.exists(input_pdf_path):
+            try: os.remove(input_pdf_path); print(f"  OCRmyPDF: Cleaned up input temp file: {input_pdf_path}")
+            except Exception as e_clean_in: print(f"  OCRmyPDF: Warning - could not delete input temp file {input_pdf_path}: {e_clean_in}")
+        if output_pdf_path and os.path.exists(output_pdf_path):
+            try: os.remove(output_pdf_path); print(f"  OCRmyPDF: Cleaned up output temp file: {output_pdf_path}")
+            except Exception as e_clean_out: print(f"  OCRmyPDF: Warning - could not delete output temp file {output_pdf_path}: {e_clean_out}")
+
+# ### Gemini Analysis
+
+def get_gemini_analysis(document_text):
+    default_error_rating = "Error: AI Analysis Failed"
+    default_error_explanation = "Error: AI Analysis Failed to provide explanation."
+    default_error_summary = "Error: AI Analysis Failed to provide summary."
+
+    if not model or not document_text:
+        print("    Gemini model not available or no document text provided for analysis.")
+        return default_error_rating, default_error_explanation, default_error_summary
+
+    # Ensure you're configuring for JSON output.
+    # If 'model' was initialized with genai.GenerativeModel(GEMINI_MODEL_NAME) without generation_config,
+    # you might need to specify it here, or re-initialize the model with it.
+    # Assuming your global 'model' was initialized with JSON config like in previous snippets:
+    # generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
+    # model = genai.GenerativeModel(GEMINI_MODEL_NAME, generation_config=generation_config)
+
+    prompt_combined_json = f"""
+    Analyze the following document text, which is in Spanish.
+    Based on your analysis, generate a JSON object with the following three keys:
+    1. "riesgo_rating": A single string value representing the overall risk level. Choose EXCLUSIVELY from this list: {RISK_CATEGORIES}. This rating should be based on the presence, severity, and quantity of warning/alarming statements, and the extent of any danger stated.
+    2. "riesgo_explicacion": A detailed textual explanation IN SPANISH. Start your explanation by explicitly stating the assigned 'riesgo_rating' and then detail the primary reasons for this rating, referencing specific warnings, dangers, and concerns from the document. For example: 'El riesgo se considera [valor de riesgo_rating] debido a [razones principales y detalles específicos del documento].' Ensure any special characters like backslashes or quotes within this explanation are correctly escaped for JSON string format (e.g., a backslash should be '\\\\', a quote '\\"').
+    3. "resumen_detallado_ia": A comprehensive and explanatory summary of the entire document, IN SPANISH. **This summary MUST be less than 1000 words.** It should focus on key findings, methodologies (if applicable), conclusions, and recommendations. Ensure any special characters like backslashes or quotes within this summary are correctly escaped for JSON string format.
+
+    Ensure the output is ONLY a valid JSON object. Do not add any text before or after the JSON object. All string values inside the JSON must be properly JSON escaped. Example format:
+    {{
+      "riesgo_rating": "bajo",
+      "riesgo_explicacion": "El riesgo se considera bajo porque solo se mencionaron algunas preocupaciones menores y no hay indicios de peligro inminente. Por ejemplo, una ruta de archivo podría ser C:\\\\Users\\\\temp.",
+      "resumen_detallado_ia": "El documento trata sobre la \\"importancia\\" de..."
+    }}
+
+    Document Text (Spanish):
+    ---
+    {document_text[:1500000]} 
+    ---
+
+    JSON Output:
+    """
+
+    print("    Requesting combined (rating, explanation, summary) JSON from Gemini...")
+    raw_response_text_for_debug = "No response received" # For debugging
+
+    try:
+        # Explicitly set timeout for the API call if needed
+        response = model.generate_content(prompt_combined_json, request_options={'timeout': 180})
+
+        if not response.parts:
+            # ... (your existing block reason handling is good) ...
+            block_reason_str = "Unknown reason"
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason is not None:
+                    block_reason_str = str(response.prompt_feedback.block_reason)
+                elif hasattr(response.prompt_feedback, 'safety_ratings'):
+                    for rating_info in response.prompt_feedback.safety_ratings:
+                        # Assuming genai.types.HarmProbability is imported or accessible
+                        # You might need: from google.generativeai.types import HarmProbability
+                        # if HarmProbability.NEGLIGIBLE etc. are not found.
+                        # For simplicity, checking against string representations if direct enum access is an issue:
+                        if str(rating_info.probability) not in ["HarmProbability.NEGLIGIBLE", "HarmProbability.LOW"]:
+                           block_reason_str = f"Safety block - Category: {rating_info.category}, Probability: {rating_info.probability.name}"
+                           break
+            print(f"    Gemini API Warning: No content parts in response. Effective Block reason: {block_reason_str}.")
+            return f"AI Error: No Parts ({block_reason_str})", default_error_explanation, default_error_summary
+
+        raw_response_text_for_debug = response.text # Store for debugging before parsing
+
+        # Enhanced cleaning and extraction of JSON block
+        text_to_parse = raw_response_text_for_debug.strip()
+
+        # Try to find the outermost JSON object
+        match = re.search(r"\{.*\}", text_to_parse, re.DOTALL)
+        if match:
+            json_candidate_text = match.group(0)
+            print(f"    Extracted JSON candidate (from regex): {json_candidate_text[:100]}...")
+        else:
+            # Fallback: remove markdown backticks if they exist (more brittle)
+            if text_to_parse.startswith("```json"):
+                text_to_parse = text_to_parse[len("```json"):]
+            if text_to_parse.endswith("```"):
+                text_to_parse = text_to_parse[:-len("```")]
+            json_candidate_text = text_to_parse.strip()
+            print(f"    Using text after stripping markdown (if any) as JSON candidate: {json_candidate_text[:100]}...")
+
+        try:
+            # The json.loads() might still fail if the content isn't perfect JSON
+            # (e.g. unescaped newlines inside strings, trailing commas)
+            response_json = json.loads(json_candidate_text)
+
+            categorical_riesgo = response_json.get("riesgo_rating", default_error_rating).strip().lower()
+            risk_explanation = response_json.get("riesgo_explicacion", default_error_explanation).strip()
+            resumen_ia = response_json.get("resumen_detallado_ia", default_error_summary).strip()
+
+            if categorical_riesgo not in RISK_CATEGORIES and not categorical_riesgo.startswith("Error:"):
+                print(f"    Warning: Gemini returned an invalid risk category: '{categorical_riesgo}'.")
+                categorical_riesgo = f"Error: Invalid Category ({categorical_riesgo})"
+
+            return categorical_riesgo, risk_explanation, resumen_ia
+
+        except json.JSONDecodeError as e_json:
+            print(f"    Error decoding JSON from Gemini: {e_json}")
+            print(f"    Problematic JSON candidate text (first 500 chars): {json_candidate_text[:500]}")
+            # For "Extra data" errors, the issue might be after the valid JSON part.
+            # For "Unterminated string" or "Invalid control character", the issue is within.
+            return "Error: JSON Decode", f"JSON Error - {e_json}", f"JSON Error - {e_json}"
+        except AttributeError: # If response.text was None
+            print(f"    Error: response.text was None or attribute error from Gemini response object.")
+            return "Error: Response Attribute", default_error_explanation, default_error_summary
+
+    except Exception as e_api:
+        print(f"    Major Error during Gemini API call or critical response issue: {type(e_api).__name__} - {e_api}")
+        print(traceback.format_exc()) # Print full traceback for API errors
+        # Also print the raw response text if available and different from default
+        if raw_response_text_for_debug != "No response received":
+            print(f"    Raw text received before error (if any): {raw_response_text_for_debug[:500]}")
+        return f"API Exception: {type(e_api).__name__}", default_error_explanation, default_error_summary
+
+# ## -------- DSPACE DATA RETRIEVAL --------
+
+# ### Get records
+
+def get_dspace_data(url):
+    print("Connecting to DSpace repository and requesting records...")
+
+    sickle_instance = Sickle(url, 
+                             # user_agent=user_agent_string, 
+                             max_retries=10, 
+                             timeout=120)
+    try:
+        # records = sickle_instance.ListRecords(metadataPrefix='oai_dc', ignore_deleted=True)
+        records = sickle_instance.ListRecords(**{'metadataPrefix': 'oai_dc','from': DSpace_start}, ignore_deleted=True)
+        mylist = list()
+        for i, record in enumerate(records):
+            mylist.append(record.metadata)
+            if (i + 1) % 100 == 0: print(f"  Processed {i+1} records from DSpace...")
+        if not mylist: print("No records found in DSpace repository."); return pd.DataFrame()
+        myDF = pd.DataFrame(mylist)
+        print(f"Successfully retrieved {len(myDF)} raw records from DSpace.")
+        return myDF
+    except Exception as e:
+        print(f"Error retrieving data from DSpace: {e}"); return pd.DataFrame()
+
+def get_dspace_data_scythe(url):
+    print("Connecting to DSpace repository and requesting records...")
+
+    scythe = Scythe(url, 
+                    # user_agent=user_agent_string, 
+                    max_retries=10, 
+                    timeout=120)
+    try:
+        records = scythe.list_records(metadata_prefix='oai_dc',from_= DSpace_start, ignore_deleted=True)
+        mylist = list()
+        for i, record in enumerate(records):
+            mylist.append(record.metadata)
+            if (i + 1) % 100 == 0: print(f"  Processed {i+1} records from DSpace...")
+        if not mylist: print("No records found in DSpace repository."); return pd.DataFrame()
+        myDF = pd.DataFrame(mylist)
+        print(f"Successfully retrieved {len(myDF)} raw records from DSpace.")
+        return myDF
+    except Exception as e:
+        print(f"Error retrieving data from DSpace: {e}"); return pd.DataFrame()
+
+# ### Process records
+
+def process_dspace_records(myDF_raw):
+    if myDF_raw.empty: return pd.DataFrame()
+
+    print("Processing DSpace records (Original Logic for DSpace fields)...")
+    myDF = myDF_raw.copy()
+    myDF["matter"]=False
+
+    myDF.loc[myDF.type.isna(),"type"]=myDF.loc[myDF.type.isna(),"type"].apply(lambda x:[""])
+    myDF['tipos_str'] = [', '.join(map(str, l)) for l in myDF['type']]
+    s1=myDF["type"].explode(); cond = s1.str.contains('informe', case=False, na=False) 
+    myDF.loc[s1[cond].index.unique(),"matter"]=True; myDF=myDF[myDF.matter].copy() 
+
+    if myDF.empty: print("No 'informe' records after filtering."); return pd.DataFrame()
+
+    myDF.loc[:,'resumen']=myDF.description.apply(lambda x: x[0] if isinstance(x, list) and x else None)
+    myDF.loc[myDF.subject.isna(),"subject"]=myDF.loc[myDF.subject.isna(),"subject"].apply(lambda x:[""])
+    myDF['topicos_str'] = [', '.join(map(str, l)) for l in myDF['subject']]
+    myDF.loc[:,"publicado_str"]=myDF.date.apply(lambda x: x[2] if isinstance(x, list) and len(x) > 2 else (x[0] if isinstance(x, list) and len(x) > 0 else None))
+    import dateparser 
+    myDF.loc[:,"fecha_publicado"]=myDF.publicado_str.apply(lambda x: dateparser.parse(x, settings={'PREFER_DAY_OF_MONTH': 'first', "PREFER_MONTH_OF_YEAR": "first"}) if pd.notna(x) else pd.NaT)
+    myDF['fecha_publicado'] = pd.to_datetime(myDF['fecha_publicado'], errors='coerce')
+    myDF.loc[:,"fecha_str"]=myDF.date.apply(lambda x: x[0] if isinstance(x, list) and x else None)
+    myDF.loc[:,'titulo']=myDF.title.apply(lambda x: x[0] if isinstance(x, list) and x else None)
+    myDF.loc[:,'title_N']=myDF.title.apply(lambda x: len(x) if isinstance(x, list) else 0) # RESTORED
+    myDF['consecutivo'] = pd.NA 
+    myDF.loc[myDF.title_N!=1,"consecutivo"]=myDF.loc[myDF.title_N!=1,"title"].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else pd.NA) # RESTORED
+    myDF['relaciones_str'] = pd.NA 
+    myDF.loc[~myDF.relation.isna(),"relaciones_str"]=myDF.loc[~myDF.relation.isna(),"relation"].apply(lambda x: x[0] if isinstance(x, list) and x else pd.NA)
+    myDF.loc[~myDF.relaciones_str.isna(),"relaciones_str"]=myDF.loc[~myDF.relaciones_str.isna(),"relaciones_str"].apply(lambda x: x.replace(";","") if isinstance(x, str) else x)
+    fill_consecutivo_mask = myDF.consecutivo.isna() & myDF.relaciones_str.notna()
+    myDF.loc[fill_consecutivo_mask,"consecutivo"] = myDF.loc[fill_consecutivo_mask,"relaciones_str"] # RESTORED
+    myDF['autores']= myDF.creator.apply(lambda x: '; '.join(map(str, x)) if isinstance(x, list) and x else None)
+    myDF.loc[myDF.publisher.isna(),"publisher"]=myDF.loc[myDF.publisher.isna(),"publisher"].apply(lambda x:[""])
+    myDF.loc[~myDF.publisher.isna(),'publicador']=myDF.loc[~myDF.publisher.isna(),"publisher"].apply(lambda x: x[0] if isinstance(x, list) and x else None)
+    myDF.loc[:,'formato']=myDF.format.apply(lambda x: x[0] if isinstance(x, list) and x else None)
+    myDF.loc[~myDF.language.isna(),'idioma']=myDF.loc[~myDF.language.isna(),"language"].apply(lambda x: x[0] if isinstance(x, list) and x else None)
+    myDF.loc[:,'enlace'] = myDF.identifier.apply(lambda x: x[-1] if isinstance(x, list) and x and isinstance(x[-1], str) and x[-1].startswith('http') else None)
+
+    # Columns to be returned by this function (original DSpace fields)
+    # Renamed some for clarity (e.g., tipos_str) to avoid potential clashes later
+    # if 'tipos' is used as a final name after more processing.
+    original_dspace_columns = [
+        'enlace', 'titulo', 'title_N', 'autores', 'fecha_publicado', 'resumen', 
+        'topicos_str', 'tipos_str', 'publicador', 'formato', 'idioma', 'consecutivo', 
+        'fecha_str', 'publicado_str', 'relaciones_str'
+    ]
+    finalDF_original_fields = pd.DataFrame()
+    for col_name in original_dspace_columns: # Changed col to col_name
+        if col_name in myDF.columns:
+            finalDF_original_fields[col_name] = myDF[col_name]
+        else: # Should ideally not happen if myDF processing is correct
+            finalDF_original_fields[col_name] = 0 if col_name == 'title_N' else \
+                                                (pd.NaT if col_name == 'fecha_publicado' else "")
+            print(f"Warning: DSpace column '{col_name}' was missing, initialized default.")
+
+    finalDF_original_fields.sort_values(by='fecha_publicado',ascending=False,inplace=True)
+    finalDF_original_fields.reset_index(drop=True, inplace=True) 
+    print(f"{len(finalDF_original_fields)} DSpace records processed for original fields.")
+    return finalDF_original_fields
+
+# ## -------- GOOGLE SHEETS INTERACTIONS --------
+
+# ### Connect to Google Sheet
+
+def get_google_sheet_connection(api_secret_json_str, sheet_id_or_name):
+    if not api_secret_json_str: print("\nGoogle API secret is missing."); return None
+    try:
+        credentials_dict = json.loads(api_secret_json_str); gc = gspread.service_account_from_dict(credentials_dict)
+        sh = gc.open_by_key(sheet_id_or_name); print(f"\nSuccessfully connected to Google Sheet: {sh.title}"); return sh
+    except json.JSONDecodeError as e: print(f"\nError decoding Google API JSON secret: {e}."); return None
+    except Exception as e: print(f"\nError connecting to Google Sheets: {e}"); return None
+
+# ### Get master sheet
+
+def get_master_sheet_data(sheet_connection, sheet_name): # Same as before, ensures pdf_link_direct, risk_explanation
+    default_ai_cols = {'riesgo': "Not generated", 'risk_explanation': "Not generated", 'resumen_IA': "Not generated"}
+    try:
+        worksheet = sheet_connection.worksheet(sheet_name); print(f"Reading data from master sheet: '{sheet_name}'")
+        df = get_as_dataframe(worksheet, evaluate_formulas=True, header=0, na_filter=False, dtype=str) 
+        for col_check in ['enlace', 'pdf_link_direct', 'title_N']: # Added title_N
+             if col_check not in df.columns: print(f"Warning: '{col_check}' not found. Creating."); df[col_check] = "0" if col_check == 'title_N' else ""
+        for col, default_val in default_ai_cols.items():
+            if col not in df.columns: print(f"Column '{col}' not found. Adding with default."); df[col] = default_val
+            else: df[col] = df[col].astype(str).replace('', default_val).fillna(default_val)
+        if 'fecha_publicado' in df.columns: df['fecha_publicado'] = pd.to_datetime(df['fecha_publicado'], errors='coerce')
+        else: print(f"Warning: 'fecha_publicado' not found."); df['fecha_publicado'] = pd.NaT
+        if 'title_N' in df.columns: df['title_N'] = pd.to_numeric(df['title_N'], errors='coerce').fillna(0).astype(int) # Convert title_N to int
+
+        print(f"Read {len(df)} records from '{sheet_name}'"); return df, worksheet
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"Master sheet '{sheet_name}' not found. Will define structure for new one.")
+        empty_cols = ['enlace', 'titulo', 'title_N', 'autores', 'fecha_publicado', 'resumen', 'topicos',
+                      'tipos', 'publicador', 'formato', 'idioma', 'consecutivo', 'fecha',
+                      'publicado', 'relaciones', 'pdf_link_direct',
+                      'riesgo', 'risk_explanation', 'resumen_IA']
+        empty_df_data = {}
+        for col in empty_cols:
+            if col == 'fecha_publicado': empty_df_data[col] = pd.Series(dtype='datetime64[ns]')
+            elif col == 'title_N': empty_df_data[col] = pd.Series(dtype='int')
+            else: empty_df_data[col] = pd.Series(dtype='str')
+        return pd.DataFrame(empty_df_data), None 
+    except Exception as e:
+        print(f"Error reading master sheet '{sheet_name}': {e}")
+        empty_cols_err = ['enlace', 'riesgo', 'risk_explanation', 'resumen_IA', 'fecha_publicado', 'pdf_link_direct', 'titulo', 'title_N']
+        empty_df_data_err = {col: pd.Series(dtype='str') for col in empty_cols_err if col not in ['fecha_publicado', 'title_N']}
+        empty_df_data_err['fecha_publicado'] = pd.Series(dtype='datetime64[ns]'); empty_df_data_err['title_N'] = pd.Series(dtype='int')
+        return pd.DataFrame(empty_df_data_err), None
+
+# ## -------- MAIN SCRIPT LOGIC --------
+
+def main():
+    print(f"\nScript started at:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if not GOOGLE_API_SECRET or not GOOGLE_SHEET_ID: print("Secrets missing. Exiting."); return
+
+    ### GET RECORDS FROM REPO DSPACE
+    # raw_dspace_df = get_dspace_data(URL)
+    raw_dspace_df = get_dspace_data_scythe(URL)
+
+    # globals()['raw_dspace_df']=raw_dspace_df
+    if raw_dspace_df.empty: print("No DSpace data. Exiting."); return
+
+    ### CREATE DF WITH RECORDS
+    base_df_from_dspace = process_dspace_records(raw_dspace_df)
+    # globals()['base_df_from_dspace']=base_df_from_dspace
+
+    if base_df_from_dspace.empty: print("No processable DSpace records. Exiting."); return
+
+    ### CREATE NEW COLUMNS FOR PROCESSING
+    augmented_dspace_df = base_df_from_dspace.copy()
+    if 'pdf_link_direct' not in augmented_dspace_df.columns: augmented_dspace_df['pdf_link_direct'] = ""
+    if 'riesgo' not in augmented_dspace_df.columns: augmented_dspace_df['riesgo'] = "Not generated"
+    if 'risk_explanation' not in augmented_dspace_df.columns: augmented_dspace_df['risk_explanation'] = "Not generated"
+    if 'resumen_IA' not in augmented_dspace_df.columns: augmented_dspace_df['resumen_IA'] = "Not generated"
+
+    ### CONNECT TO GSHEET
+    gs_connection = get_google_sheet_connection(GOOGLE_API_SECRET, GOOGLE_SHEET_ID)
+    if not gs_connection: print("GSheet connection failed. Exiting."); return
+
+    ### GET MASTER DF FROM GSHEET
+    master_df, master_worksheet = get_master_sheet_data(gs_connection, MASTER_SHEET_NAME) 
+    ALL_FINAL_COLUMNS = ['enlace', 'titulo', 'title_N', 'autores', 'fecha_publicado', 'resumen', 'topicos_str', 'tipos_str', 'publicador', 'formato', 'idioma', 'consecutivo', 'fecha_str', 'publicado_str', 'relaciones_str', 'pdf_link_direct', 'riesgo', 'risk_explanation', 'resumen_IA']
+
+    ### CREATE MASTER IS NOT EXIST
+    if master_worksheet is None: 
+         print(f"Master sheet '{MASTER_SHEET_NAME}' creating attempt.")
+         try:
+            expected_cols_new_sheet = ALL_FINAL_COLUMNS 
+            master_worksheet = gs_connection.add_worksheet(title=MASTER_SHEET_NAME, rows=1, cols=len(expected_cols_new_sheet))
+            master_worksheet.update([expected_cols_new_sheet], 'A1') 
+            print(f"Master sheet '{MASTER_SHEET_NAME}' created with headers: {expected_cols_new_sheet}")
+
+            master_df = pd.DataFrame(columns=expected_cols_new_sheet) 
+            if 'fecha_publicado' in master_df.columns: master_df['fecha_publicado'] = pd.to_datetime(master_df['fecha_publicado'], errors='coerce')
+            if 'title_N' in master_df.columns: master_df['title_N'] = pd.to_numeric(master_df['title_N'], errors='coerce').fillna(0).astype(int)
+            for col_init in ALL_FINAL_COLUMNS:
+                 init_val = "Not generated" if col_init in ['riesgo', 'risk_explanation', 'resumen_IA'] else (0 if col_init == 'title_N' else (pd.NaT if col_init == 'fecha_publicado' else ""))
+                 if col_init not in master_df.columns: master_df[col_init] = init_val 
+                 else: 
+                    if col_init == 'fecha_publicado': master_df[col_init] = pd.to_datetime(master_df[col_init], errors='coerce').fillna(pd.NaT)
+                    elif col_init == 'title_N': master_df[col_init] = pd.to_numeric(master_df[col_init], errors='coerce').fillna(0).astype(int)
+                    else: master_df[col_init] = master_df[col_init].astype(str).fillna(init_val)
+         except Exception as e: print(f"Could not create master sheet: {e}. Exiting."); return
+
+    ### BUILD PDF LINKS
+    print("\nIdentifying records for direct PDF link extraction...")
+
+    for col_check_master in ['enlace', 'pdf_link_direct']:
+        if col_check_master not in master_df.columns: master_df[col_check_master] = ""
+        else: master_df[col_check_master] = master_df[col_check_master].astype(str).fillna("")
+
+    existing_enlaces_in_master = set(master_df['enlace'].loc[master_df['enlace'] != ''])
+    new_dspace_records_needing_check = augmented_dspace_df[~augmented_dspace_df['enlace'].astype(str).isin(existing_enlaces_in_master)].copy()
+    enlaces_from_new_dspace_records = set(new_dspace_records_needing_check['enlace'].dropna())
+    print(f"Found {len(enlaces_from_new_dspace_records)} 'enlace' URLs from new DSpace records for PDF link check.")
+    enlaces_from_master_needing_pdf_link = set(master_df.loc[(master_df['pdf_link_direct'] == '') & (master_df['enlace'] != ''), 'enlace'].dropna())
+    print(f"Found {len(enlaces_from_master_needing_pdf_link)} 'enlace' URLs in Master for PDF link check.")
+    unique_enlaces_to_fetch_pdf_for = enlaces_from_new_dspace_records.union(enlaces_from_master_needing_pdf_link)
+    print(f"Total unique landing pages to process for PDF links: {len(unique_enlaces_to_fetch_pdf_for)}")
+    enlace_to_direct_pdf_map = {}
+
+    if unique_enlaces_to_fetch_pdf_for:
+        print("Starting Selenium/BS4 for direct PDF links...")
+        processed_landing_count = 0
+        for i, landing_url in enumerate(list(unique_enlaces_to_fetch_pdf_for)): 
+            print(f"  Processing landing page {i+1}/{len(unique_enlaces_to_fetch_pdf_for)}: {landing_url}")
+            if pd.notna(landing_url) and isinstance(landing_url, str) and landing_url.startswith('http'):
+                try:
+                    direct_pdf_url = get_pdf_url(landing_url) 
+                    enlace_to_direct_pdf_map[landing_url] = direct_pdf_url if direct_pdf_url else "" 
+                    if direct_pdf_url: print(f"    Mapped '{landing_url}' to direct PDF: '{direct_pdf_url}'")
+                    else: print(f"    Could not extract PDF URL for '{landing_url}'.")
+                    processed_landing_count +=1
+                    if processed_landing_count > 0 and processed_landing_count % 5 == 0: print(f"    Pausing after {processed_landing_count} pages..."); time.sleep(3)
+                except Exception as e_sel_main: print(f"    Error get_pdf_url for '{landing_url}': {e_sel_main}"); enlace_to_direct_pdf_map[landing_url] = ""
+            else: enlace_to_direct_pdf_map[landing_url] = "" 
+        print("Finished Selenium/BS4 processing.")
+
+    if 'pdf_link_direct' not in augmented_dspace_df.columns: augmented_dspace_df['pdf_link_direct'] = ""
+    augmented_dspace_df['pdf_link_direct'] = augmented_dspace_df['enlace'].map(enlace_to_direct_pdf_map).fillna(augmented_dspace_df['pdf_link_direct'])
+    if not master_df.empty and enlace_to_direct_pdf_map:
+        update_mask_master = (master_df['pdf_link_direct'] == '') & (master_df['enlace'].isin(enlace_to_direct_pdf_map.keys()))
+        mapped_values_master = master_df.loc[update_mask_master, 'enlace'].map(enlace_to_direct_pdf_map)
+        if not mapped_values_master.empty: master_df.loc[update_mask_master, 'pdf_link_direct'] = mapped_values_master.fillna(""); print("Updated 'pdf_link_direct' in master_df.")
+
+    ### GET NEW RECORDS TO APPEND MASTER
+    if master_df.empty or not existing_enlaces_in_master: 
+        new_records_df_for_append = augmented_dspace_df.copy()
+    else: 
+        new_records_df_for_append = augmented_dspace_df[~augmented_dspace_df['enlace'].astype(str).isin(existing_enlaces_in_master)].copy()
+    print(f"Final count of new records for appending: {len(new_records_df_for_append)}")
+
+    ### APPEND NEW RECORDS
+    if not new_records_df_for_append.empty:
+        print(f"Processing {len(new_records_df_for_append)} new records for sheets...")
+        df_to_write_dated_sheet = new_records_df_for_append.copy()
+
+        for idx, row_new in df_to_write_dated_sheet.iterrows():
+            pub_date = row_new.get('fecha_publicado')
+            if pd.notna(pub_date) and hasattr(pub_date, 'year') and (pub_date < GEMINI_PROCESSING_CUTOFF_DATE):
+                df_to_write_dated_sheet.loc[idx, ['riesgo', 'risk_explanation', 'resumen_IA']] = "Not processed (Old)"
+
+        date_str = datetime.today().strftime('%Y-%m-%d'); new_sheet_title = f'New_{date_str}'
+
+        try:
+            cols_for_dated_sheet = ALL_FINAL_COLUMNS 
+            final_df_for_dated_sheet = df_to_write_dated_sheet.reindex(columns=cols_for_dated_sheet).copy()
+            try: 
+                new_records_worksheet = gs_connection.worksheet(new_sheet_title); new_records_worksheet.clear(); print(f"Cleared dated sheet: '{new_sheet_title}'.")
+            except gspread.exceptions.WorksheetNotFound: 
+                new_records_worksheet = gs_connection.add_worksheet(title=new_sheet_title, rows=max(1, len(final_df_for_dated_sheet) + 1), cols=len(cols_for_dated_sheet))
+
+            for col_dt in final_df_for_dated_sheet.select_dtypes(include=['datetime64[ns]']).columns:
+                final_df_for_dated_sheet[col_dt] = \
+                final_df_for_dated_sheet[col_dt].apply(lambda x: x.isoformat() if pd.notnull(x) and hasattr(x, 'isoformat') else "")
+
+            final_df_for_dated_sheet = final_df_for_dated_sheet.fillna('')
+            set_with_dataframe(new_records_worksheet, final_df_for_dated_sheet, include_index=False, resize=True)
+            print(f"Saved {len(final_df_for_dated_sheet)} new records to dated sheet: '{new_sheet_title}'")
+            df_to_append_master_gs = df_to_write_dated_sheet.copy()
+            master_df_before_append_len = len(master_df)
+            try: 
+                master_headers = master_worksheet.row_values(1) if master_worksheet.row_count > 0 else ALL_FINAL_COLUMNS
+                df_prep_gs_final = df_to_append_master_gs.reindex(columns=master_headers).copy()
+
+                for col_dt_gs in df_prep_gs_final.select_dtypes(include=['datetime64[ns]']).columns:
+                    df_prep_gs_final[col_dt_gs] = df_prep_gs_final[col_dt_gs].apply(lambda x: x.isoformat() if pd.notnull(x) and hasattr(x, 'isoformat') else "")
+
+                df_prep_gs_final = df_prep_gs_final.fillna('')
+                df_for_gs_append_final_vals = df_prep_gs_final.values.tolist()
+
+                if df_for_gs_append_final_vals: 
+                    print(f"Appending {len(df_for_gs_append_final_vals)} rows to master."); 
+                    master_worksheet.append_rows(df_for_gs_append_final_vals, value_input_option='USER_ENTERED'); 
+                    print("Appended to master.")
+                else: print("No data to append to master.")
+
+                temp_master_df = master_df.copy(); temp_df_to_append = df_to_write_dated_sheet.copy()
+                all_cols_concat = list(set(temp_master_df.columns) | set(temp_df_to_append.columns)); 
+                if not all_cols_concat: all_cols_concat = ALL_FINAL_COLUMNS
+                temp_master_df = temp_master_df.reindex(columns=all_cols_concat); 
+                temp_df_to_append = temp_df_to_append.reindex(columns=all_cols_concat)
+                master_df = pd.concat([temp_master_df, temp_df_to_append], ignore_index=True)
+
+                if 'fecha_publicado' in master_df.columns: 
+                    master_df['fecha_publicado'] = pd.to_datetime(master_df['fecha_publicado'], errors='coerce')
+
+                if 'title_N' in master_df.columns: 
+                    master_df['title_N'] = pd.to_numeric(master_df['title_N'], errors='coerce').fillna(0).astype(int)
+
+                for col_ai_c in ALL_FINAL_COLUMNS:
+                    init_val_c = "Not generated" if col_ai_c in ['riesgo', 'risk_explanation', 'resumen_IA'] else (0 if col_ai_c == 'title_N' else (pd.NaT if col_ai_c == 'fecha_publicado' else ""))
+                    if col_ai_c not in master_df.columns: 
+                        master_df[col_ai_c] = init_val_c
+                    else: 
+                        if col_ai_c == 'fecha_publicado': master_df[col_ai_c] = pd.to_datetime(master_df[col_ai_c], errors='coerce').fillna(pd.NaT)
+                        elif col_ai_c == 'title_N': master_df[col_ai_c] = pd.to_numeric(master_df[col_ai_c], errors='coerce').fillna(0).astype(int)
+                        elif col_ai_c in ['riesgo', 'risk_explanation', 'resumen_IA']: master_df[col_ai_c] = master_df[col_ai_c].astype(str).fillna("Not generated")
+                        else: master_df[col_ai_c] = master_df[col_ai_c].astype(str).fillna("")
+                print(f"In-memory master_df updated. Length: {len(master_df)} (was {master_df_before_append_len})")
+            except Exception as e_append: print(f"ERROR during append/master_df update: {e_append}")
+        except Exception as e_dated: print(f"Error saving to dated sheet: {e_dated}")
+    else: print("No new records to add.")
+
+    ### PROCESS WITH GEMINI
+    if not GEMINI_API_KEY or model is None: print("Gemini API not configured. Skipping AI.")
+    else:
+        print("\nStarting AI Analysis..."); master_df_updated = master_df.copy()
+
+        for col_ai_upd in ['riesgo', 'risk_explanation', 'resumen_IA']:
+            if col_ai_upd not in master_df_updated.columns: master_df_updated[col_ai_upd] = "Not generated"
+            else: master_df_updated[col_ai_upd] = master_df_updated[col_ai_upd].astype(str).replace('', "Not generated").fillna("Not generated")
+
+        if 'pdf_link_direct' not in master_df_updated.columns: master_df_updated['pdf_link_direct'] = "" 
+        else: master_df_updated['pdf_link_direct'] = master_df_updated['pdf_link_direct'].astype(str).fillna("")
+
+        processed_for_ai_count = 0
+        records_to_process_mask = (master_df_updated['riesgo'].astype(str).str.strip().str.lower() == "not generated") | (master_df_updated['risk_explanation'].astype(str).str.strip().str.lower() == "not generated") | (master_df_updated['resumen_IA'].astype(str).str.strip().str.lower() == "not generated")
+        records_to_process_indices = master_df_updated[records_to_process_mask].index
+        print(f"Found {len(records_to_process_indices)} records for AI. Checking constraints...")
+
+        for index_loop in records_to_process_indices:
+            row_loop = master_df_updated.loc[index_loop]; doc_title_loop = str(row_loop.get('titulo', 'N/A')); actual_pdf_to_process = str(row_loop.get('pdf_link_direct', '')).strip(); publish_date_loop = row_loop.get('fecha_publicado')
+
+            if pd.isna(publish_date_loop): master_df_updated.loc[index_loop, ['riesgo', 'risk_explanation', 'resumen_IA']] = "Not processed (Missing Date)"; continue 
+
+            if not (isinstance(publish_date_loop, pd.Timestamp) or isinstance(publish_date_loop, datetime)):
+                 try: publish_date_loop = pd.to_datetime(publish_date_loop)
+                 except: pass 
+
+            if not (isinstance(publish_date_loop, pd.Timestamp) or isinstance(publish_date_loop, datetime)) or pd.isna(publish_date_loop): master_df_updated.loc[index_loop, ['riesgo', 'risk_explanation', 'resumen_IA']] = "Not processed (Bad Date)"; continue
+
+            if publish_date_loop < GEMINI_PROCESSING_CUTOFF_DATE: master_df_updated.loc[index_loop, ['riesgo', 'risk_explanation', 'resumen_IA']] = "Not processed (Old)"; continue 
+            print(f"\nProcessing AI for Idx {index_loop} (T: {doc_title_loop}, Date: {publish_date_loop.strftime('%Y-%m-%d')}) Direct PDF: '{actual_pdf_to_process}'")
+
+            if not actual_pdf_to_process or not actual_pdf_to_process.lower().startswith('http'):
+                print(f"  Invalid direct PDF link ('{actual_pdf_to_process}')."); 
+                for fld_ai in ['riesgo', 'risk_explanation', 'resumen_IA']: 
+                    if str(master_df_updated.loc[index_loop, fld_ai]).strip().lower() == "not generated": master_df_updated.loc[index_loop, fld_ai] = "Invalid Direct PDF Link"
+                continue
+
+            ### EXTRACT TEXT FROM PDF with FITZ
+            document_text = None
+            print(f" Attempting text extraction with PyMuPDF (fitz) for '{actual_pdf_to_process}'...")
+            document_text_raw = extract_text_from_pdf_fitz(actual_pdf_to_process)
+
+            ### EXTRACT TEXT FROM PDF with OCRMYPDF
+            if not document_text_raw:
+                print(f" Fitz extraction failed or yielded no text. Attempting OCRmyPDF for '{actual_pdf_to_process}'...")
+                document_text_raw = extract_text_from_pdf_ocred(actual_pdf_to_process, lang_code='spa') # Your existing call
+
+            ### EXTRACT TEXT FROM PDF with PYTESSERACT
+            if not document_text_raw:
+                print(f" OCRmyPDF also failed or yielded no text. Attempting Pytesseract OCR fallback for '{actual_pdf_to_process}'...")
+                try:
+                    pytesseract.get_tesseract_version() # Check if Tesseract is callable
+                    document_text_raw = extract_text_from_pdf_ocr(actual_pdf_to_process, lang_code='spa')
+                    if document_text_raw:
+                        print(" Pytesseract OCR fallback extracted text.")
+                    else:
+                        print(" Pytesseract OCR fallback also failed or yielded no text.")
+                except Exception as e_tess:
+                    print(f" Pytesseract OCR fallback skipped: Tesseract not working or error: {e_tess}")
+
+            ### PREPPING AND PASSING TEXT TO GEMINI
+            if document_text_raw:
+                print(f" Raw extracted text length: {len(document_text_raw)}")
+                ### CLEAN TEXT
+                document_text_cleaned = clean_text_for_llm(document_text_raw) # <--- APPLY CLEANING
+                print(f" Cleaned text length: {len(document_text_cleaned)}. Sending to Gemini...")
+                ### APPLY LLM 
+                riesgo_cat_val, riesgo_expl_val, resumen_ia_val = get_gemini_analysis(document_text_cleaned)
+                if str(master_df_updated.loc[index_loop, 'riesgo']).strip().lower() == "not generated": master_df_updated.loc[index_loop, 'riesgo'] = riesgo_cat_val
+                if str(master_df_updated.loc[index_loop, 'risk_explanation']).strip().lower() == "not generated": master_df_updated.loc[index_loop, 'risk_explanation'] = riesgo_expl_val
+                if str(master_df_updated.loc[index_loop, 'resumen_IA']).strip().lower() == "not generated": master_df_updated.loc[index_loop, 'resumen_IA'] = resumen_ia_val
+                print(f"    R: {master_df_updated.loc[index_loop, 'riesgo']}, Expl: {master_df_updated.loc[index_loop, 'risk_explanation'][:50]}..., SumIA: {master_df_updated.loc[index_loop, 'resumen_IA'][:50]}...")
+                processed_for_ai_count +=1
+                time.sleep(5)
+            else:
+                ### IN CASE OF NOT HAVING TEXT FROM PDF
+                print(f"  Failed text extraction from '{actual_pdf_to_process}'."); 
+                for fld_ai_fail in ['riesgo', 'risk_explanation', 'resumen_IA']: 
+                    if str(master_df_updated.loc[index_loop, fld_ai_fail]).strip().lower() == "not generated": master_df_updated.loc[index_loop, fld_ai_fail] = "PDF Text Extraction Failed (All Methods)"
+            if processed_for_ai_count > 0 and processed_for_ai_count % 3 == 0 : print("  Pausing (3 docs)..."); time.sleep(10)
+
+        ### UPDATE MASTER AFTER GETTING GEMINI RESULTS
+        if processed_for_ai_count > 0 or len(records_to_process_indices) > 0: 
+            print(f"\nAI processing finished. {processed_for_ai_count} to Gemini. Updating master..."); 
+            try:
+                master_headers_final = master_worksheet.row_values(1) if master_worksheet.row_count > 0 else ALL_FINAL_COLUMNS
+                final_df_to_upload = master_df_updated.copy().reindex(columns=master_headers_final)
+
+                for col_final_dt_upd in final_df_to_upload.select_dtypes(include=['datetime64[ns]']).columns: 
+                    final_df_to_upload[col_final_dt_upd] = final_df_to_upload[col_final_dt_upd].apply(lambda x: x.isoformat() if pd.notnull(x) and hasattr(x, 'isoformat') else "")
+
+                final_df_to_upload = final_df_to_upload.fillna('') 
+                set_with_dataframe(master_worksheet, final_df_to_upload, include_index=False, resize=True); print("Master sheet updated.")
+            except Exception as e_master_upd: print(f"Error updating master sheet: {e_master_upd}")
+        else: print("No records required AI updates.")
+    print("\nScript finished at:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+# # Execute
+
+if __name__ == '__main__':
+    main()
