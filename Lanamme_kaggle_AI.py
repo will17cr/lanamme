@@ -2,6 +2,7 @@
 # %% [code]
 # %% [code]
 # %% [code]
+# %% [code]
 # coding: utf-8
 
 # # Procesamiento informes
@@ -779,9 +780,13 @@ def process_dspace_records(myDF_raw):
     myDF['topicos_str'] = [', '.join(map(str, l)) for l in myDF['subject']]
     myDF.loc[:,"publicado_str"]=myDF.date.apply(lambda x: x[2] if isinstance(x, list) and len(x) > 2 else (x[0] if isinstance(x, list) and len(x) > 0 else None))
     import dateparser 
-    myDF.loc[:,"fecha_publicado"]=myDF.publicado_str.apply(lambda x: dateparser.parse(x, settings={'PREFER_DAY_OF_MONTH': 'first', "PREFER_MONTH_OF_YEAR": "first"}) if pd.notna(x) else pd.NaT)
-    myDF['fecha_publicado'] = pd.to_datetime(myDF['fecha_publicado'], errors='coerce')
+    
     myDF.loc[:,"fecha_str"]=myDF.date.apply(lambda x: x[0] if isinstance(x, list) and x else None)
+
+    myDF.loc[:,"fecha_publicado"]=myDF.fecha_str.apply(lambda x: dateparser.parse(x, settings={'PREFER_DAY_OF_MONTH': 'first', "PREFER_MONTH_OF_YEAR": "first"}) if pd.notna(x) else pd.NaT)
+    myDF['fecha_publicado'] = pd.to_datetime(myDF['fecha_publicado'], errors='coerce')
+
+    
     myDF.loc[:,'titulo']=myDF.title.apply(lambda x: x[0] if isinstance(x, list) and x else None)
     myDF.loc[:,'title_N']=myDF.title.apply(lambda x: len(x) if isinstance(x, list) else 0) # RESTORED
     myDF['consecutivo'] = pd.NA 
