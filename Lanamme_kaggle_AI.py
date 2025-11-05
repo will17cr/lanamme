@@ -51,6 +51,10 @@ os.system('pip install pymupdf')
 
 os.system('pip install ocrmypdf')
 
+os.system('pip install "img2pdf<0.6.2"')
+
+# os.system('pip install glymur')
+
 os.system('pip install pytesseract Pillow') # For OCR
 
 # # Procesamiento informes LANAMME desde repositorio
@@ -180,7 +184,11 @@ GEMINI_PROCESSING_CUTOFF_DATE = datetime(2024, 1, 1)
 
 # ### Gemini specification model
 
-GEMINI_MODEL_NAME = 'gemini-2.5-flash-preview-05-20' # Or your preferred model
+GEMINI_MODEL_NAME = 'gemini-2.5-flash' # Or your preferred model
+
+# GEMINI_MODEL_NAME = 'gemini-2.5-flash-preview-09-2025' # Or your preferred model
+
+# GEMINI_MODEL_NAME = 'gemini-2.5-flash-preview-05-20' # Or your preferred model
 
 # GEMINI_MODEL_NAME = 'gemini-2.5-pro-preview-03-25' # Or your preferred model
 
