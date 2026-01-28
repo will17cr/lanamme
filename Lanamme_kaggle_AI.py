@@ -184,7 +184,7 @@ GEMINI_PROCESSING_CUTOFF_DATE = datetime(2024, 1, 1)
 
 # ### Gemini specification model
 
-GEMINI_MODEL_NAME = 'gemini-3.0-flash' # Or your preferred model
+GEMINI_MODEL_NAME = 'gemini-3-flash' # Or your preferred model
 
 # GEMINI_MODEL_NAME = 'gemini-2.5-flash' # Or your preferred model
 
