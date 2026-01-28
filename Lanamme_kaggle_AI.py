@@ -184,7 +184,9 @@ GEMINI_PROCESSING_CUTOFF_DATE = datetime(2024, 1, 1)
 
 # ### Gemini specification model
 
-GEMINI_MODEL_NAME = 'gemini-2.5-flash' # Or your preferred model
+GEMINI_MODEL_NAME = 'gemini-3.0-flash' # Or your preferred model
+
+# GEMINI_MODEL_NAME = 'gemini-2.5-flash' # Or your preferred model
 
 # GEMINI_MODEL_NAME = 'gemini-2.5-flash-preview-09-2025' # Or your preferred model
 
@@ -621,6 +623,7 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 
 # ### Gemini Analysis
 
+
 # def get_gemini_analysis(document_text):
 #     default_error_rating = "Error: AI Analysis Failed"
 #     default_error_explanation = "Error: AI Analysis Failed to provide explanation."
@@ -629,13 +632,6 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 #     if not model or not document_text:
 #         print("    Gemini model not available or no document text provided for analysis.")
 #         return default_error_rating, default_error_explanation, default_error_summary
-
-#     # Ensure you're configuring for JSON output.
-#     # If 'model' was initialized with genai.GenerativeModel(GEMINI_MODEL_NAME) without generation_config,
-#     # you might need to specify it here, or re-initialize the model with it.
-#     # Assuming your global 'model' was initialized with JSON config like in previous snippets:
-#     # generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
-#     # model = genai.GenerativeModel(GEMINI_MODEL_NAME, generation_config=generation_config)
 
 #     prompt_combined_json = f"""
 #     Analyze the following document text, which is in Spanish.
@@ -653,7 +649,7 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 
 #     Document Text (Spanish):
 #     ---
-#     {document_text[:1500000]} 
+#     {document_text[:1500000]}
 #     ---
 
 #     JSON Output:
@@ -664,6 +660,7 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 
 #     try:
 #         # Explicitly set timeout for the API call if needed
+#         # It's good that you have request_options={'timeout': 180}
 #         response = model.generate_content(prompt_combined_json, request_options={'timeout': 180})
 
 #         if not response.parts:
@@ -674,10 +671,6 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 #                     block_reason_str = str(response.prompt_feedback.block_reason)
 #                 elif hasattr(response.prompt_feedback, 'safety_ratings'):
 #                     for rating_info in response.prompt_feedback.safety_ratings:
-#                         # Assuming genai.types.HarmProbability is imported or accessible
-#                         # You might need: from google.generativeai.types import HarmProbability
-#                         # if HarmProbability.NEGLIGIBLE etc. are not found.
-#                         # For simplicity, checking against string representations if direct enum access is an issue:
 #                         if str(rating_info.probability) not in ["HarmProbability.NEGLIGIBLE", "HarmProbability.LOW"]:
 #                            block_reason_str = f"Safety block - Category: {rating_info.category}, Probability: {rating_info.probability.name}"
 #                            break
@@ -686,33 +679,43 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 
 #         raw_response_text_for_debug = response.text # Store for debugging before parsing
 
-#         # Enhanced cleaning and extraction of JSON block
+#         # --- ENHANCED JSON EXTRACTION LOGIC ---
 #         text_to_parse = raw_response_text_for_debug.strip()
+#         json_candidate_text = None
 
-#         # Try to find the outermost JSON object
-#         match = re.search(r"\{.*\}", text_to_parse, re.DOTALL)
-#         if match:
-#             json_candidate_text = match.group(0)
-#             print(f"    Extracted JSON candidate (from regex): {json_candidate_text[:100]}...")
+#         # 1. Try to find content within markdown code blocks (```json ... ```)
+#         #    Using re.DOTALL to match across newlines
+#         match_code_block = re.search(r"```json\s*(.*?)\s*```", text_to_parse, re.DOTALL)
+#         if match_code_block:
+#             json_candidate_text = match_code_block.group(1).strip()
+#             print(f"    Extracted JSON from markdown block.")
 #         else:
-#             # Fallback: remove markdown backticks if they exist (more brittle)
-#             if text_to_parse.startswith("```json"):
-#                 text_to_parse = text_to_parse[len("```json"):]
-#             if text_to_parse.endswith("```"):
-#                 text_to_parse = text_to_parse[:-len("```")]
-#             json_candidate_text = text_to_parse.strip()
-#             print(f"    Using text after stripping markdown (if any) as JSON candidate: {json_candidate_text[:100]}...")
+#             # 2. Try to find the first/outermost JSON object directly (most common fallback)
+#             match_json_object = re.search(r"\{.*\}", text_to_parse, re.DOTALL)
+#             if match_json_object:
+#                 json_candidate_text = match_json_object.group(0).strip()
+#                 print(f"    Extracted JSON using regex for outermost curly braces.")
+#             else:
+#                 # 3. If no clear JSON block or object, assume the whole response *should* be JSON
+#                 #    and try to clean common non-JSON prefixes/suffixes. This is more risky.
+#                 json_candidate_text = text_to_parse.strip()
+#                 print(f"    No clear JSON block found, attempting to parse entire response.")
 
+#         if not json_candidate_text:
+#             print("    Failed to extract any JSON candidate text.")
+#             return "Error: No JSON Candidate", default_error_explanation, default_error_summary
+
+#         print(f"    JSON candidate (first 500 chars): {json_candidate_text[:500]}...")
+
+#         # Attempt to load the JSON
 #         try:
-#             # The json.loads() might still fail if the content isn't perfect JSON
-#             # (e.g. unescaped newlines inside strings, trailing commas)
 #             response_json = json.loads(json_candidate_text)
 
 #             categorical_riesgo = response_json.get("riesgo_rating", default_error_rating).strip().lower()
 #             risk_explanation = response_json.get("riesgo_explicacion", default_error_explanation).strip()
 #             resumen_ia = response_json.get("resumen_detallado_ia", default_error_summary).strip()
 
-#             if categorical_riesgo not in RISK_CATEGORIES and not categorical_riesgo.startswith("Error:"):
+#             if categorical_riesgo not in RISK_CATEGORIES and not categorical_riesgo.startswith("error:"): # Lowercased "Error:" for robustness
 #                 print(f"    Warning: Gemini returned an invalid risk category: '{categorical_riesgo}'.")
 #                 categorical_riesgo = f"Error: Invalid Category ({categorical_riesgo})"
 
@@ -720,9 +723,7 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 
 #         except json.JSONDecodeError as e_json:
 #             print(f"    Error decoding JSON from Gemini: {e_json}")
-#             print(f"    Problematic JSON candidate text (first 500 chars): {json_candidate_text[:500]}")
-#             # For "Extra data" errors, the issue might be after the valid JSON part.
-#             # For "Unterminated string" or "Invalid control character", the issue is within.
+#             print(f"    Problematic JSON candidate text (first 1000 chars):\n{json_candidate_text[:1000]}")
 #             return "Error: JSON Decode", f"JSON Error - {e_json}", f"JSON Error - {e_json}"
 #         except AttributeError: # If response.text was None
 #             print(f"    Error: response.text was None or attribute error from Gemini response object.")
@@ -733,8 +734,11 @@ def extract_text_from_pdf_ocred(pdf_url_direct, lang_code='spa'):
 #         print(traceback.format_exc()) # Print full traceback for API errors
 #         # Also print the raw response text if available and different from default
 #         if raw_response_text_for_debug != "No response received":
-#             print(f"    Raw text received before error (if any): {raw_response_text_for_debug[:500]}")
+#             print(f"    Raw text received before error (if any - first 1000 chars):\n{raw_response_text_for_debug[:1000]}")
 #         return f"API Exception: {type(e_api).__name__}", default_error_explanation, default_error_summary
+
+from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, InternalServerError
+import time
 
 def get_gemini_analysis(document_text):
     default_error_rating = "Error: AI Analysis Failed"
@@ -761,7 +765,7 @@ def get_gemini_analysis(document_text):
 
     Document Text (Spanish):
     ---
-    {document_text[:1500000]}
+    {document_text[:1500000]} 
     ---
 
     JSON Output:
@@ -770,84 +774,74 @@ def get_gemini_analysis(document_text):
     print("    Requesting combined (rating, explanation, summary) JSON from Gemini...")
     raw_response_text_for_debug = "No response received" # For debugging
 
-    try:
-        # Explicitly set timeout for the API call if needed
-        # It's good that you have request_options={'timeout': 180}
-        response = model.generate_content(prompt_combined_json, request_options={'timeout': 180})
+    # --- RETRY LOGIC START ---
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            # Explicitly set timeout for the API call
+            response = model.generate_content(prompt_combined_json, request_options={'timeout': 180})
+            
+            # If successful, break the loop and process response
+            break 
 
+        except (ResourceExhausted, ServiceUnavailable, InternalServerError) as e_quota:
+            retry_count += 1
+            wait_time = 60 * retry_count # Wait 60s, then 120s, etc.
+            print(f"    API Quota Hit or Server Error ({type(e_quota).__name__}). Sleeping for {wait_time} seconds before retry {retry_count}/{max_retries}...")
+            time.sleep(wait_time)
+            if retry_count == max_retries:
+                return f"Error: Quota Exceeded ({type(e_quota).__name__})", default_error_explanation, default_error_summary
+        
+        except Exception as e_api:
+            # For other errors (like invalid argument), fail immediately
+            print(f"    Major Error during Gemini API call: {type(e_api).__name__} - {e_api}")
+            return f"API Exception: {type(e_api).__name__}", default_error_explanation, default_error_summary
+    # --- RETRY LOGIC END ---
+
+    # --- PROCESS RESPONSE (Existing Logic) ---
+    try:
         if not response.parts:
-            # ... (your existing block reason handling is good) ...
             block_reason_str = "Unknown reason"
             if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
                 if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason is not None:
                     block_reason_str = str(response.prompt_feedback.block_reason)
-                elif hasattr(response.prompt_feedback, 'safety_ratings'):
-                    for rating_info in response.prompt_feedback.safety_ratings:
-                        if str(rating_info.probability) not in ["HarmProbability.NEGLIGIBLE", "HarmProbability.LOW"]:
-                           block_reason_str = f"Safety block - Category: {rating_info.category}, Probability: {rating_info.probability.name}"
-                           break
-            print(f"    Gemini API Warning: No content parts in response. Effective Block reason: {block_reason_str}.")
             return f"AI Error: No Parts ({block_reason_str})", default_error_explanation, default_error_summary
 
-        raw_response_text_for_debug = response.text # Store for debugging before parsing
-
-        # --- ENHANCED JSON EXTRACTION LOGIC ---
+        raw_response_text_for_debug = response.text 
         text_to_parse = raw_response_text_for_debug.strip()
         json_candidate_text = None
 
-        # 1. Try to find content within markdown code blocks (```json ... ```)
-        #    Using re.DOTALL to match across newlines
         match_code_block = re.search(r"```json\s*(.*?)\s*```", text_to_parse, re.DOTALL)
         if match_code_block:
             json_candidate_text = match_code_block.group(1).strip()
-            print(f"    Extracted JSON from markdown block.")
         else:
-            # 2. Try to find the first/outermost JSON object directly (most common fallback)
             match_json_object = re.search(r"\{.*\}", text_to_parse, re.DOTALL)
             if match_json_object:
                 json_candidate_text = match_json_object.group(0).strip()
-                print(f"    Extracted JSON using regex for outermost curly braces.")
             else:
-                # 3. If no clear JSON block or object, assume the whole response *should* be JSON
-                #    and try to clean common non-JSON prefixes/suffixes. This is more risky.
                 json_candidate_text = text_to_parse.strip()
-                print(f"    No clear JSON block found, attempting to parse entire response.")
 
         if not json_candidate_text:
-            print("    Failed to extract any JSON candidate text.")
             return "Error: No JSON Candidate", default_error_explanation, default_error_summary
 
-        print(f"    JSON candidate (first 500 chars): {json_candidate_text[:500]}...")
+        response_json = json.loads(json_candidate_text)
+        categorical_riesgo = response_json.get("riesgo_rating", default_error_rating).strip().lower()
+        risk_explanation = response_json.get("riesgo_explicacion", default_error_explanation).strip()
+        resumen_ia = response_json.get("resumen_detallado_ia", default_error_summary).strip()
 
-        # Attempt to load the JSON
-        try:
-            response_json = json.loads(json_candidate_text)
+        if categorical_riesgo not in RISK_CATEGORIES and not categorical_riesgo.startswith("error:"):
+            categorical_riesgo = f"Error: Invalid Category ({categorical_riesgo})"
 
-            categorical_riesgo = response_json.get("riesgo_rating", default_error_rating).strip().lower()
-            risk_explanation = response_json.get("riesgo_explicacion", default_error_explanation).strip()
-            resumen_ia = response_json.get("resumen_detallado_ia", default_error_summary).strip()
+        return categorical_riesgo, risk_explanation, resumen_ia
 
-            if categorical_riesgo not in RISK_CATEGORIES and not categorical_riesgo.startswith("error:"): # Lowercased "Error:" for robustness
-                print(f"    Warning: Gemini returned an invalid risk category: '{categorical_riesgo}'.")
-                categorical_riesgo = f"Error: Invalid Category ({categorical_riesgo})"
-
-            return categorical_riesgo, risk_explanation, resumen_ia
-
-        except json.JSONDecodeError as e_json:
-            print(f"    Error decoding JSON from Gemini: {e_json}")
-            print(f"    Problematic JSON candidate text (first 1000 chars):\n{json_candidate_text[:1000]}")
-            return "Error: JSON Decode", f"JSON Error - {e_json}", f"JSON Error - {e_json}"
-        except AttributeError: # If response.text was None
-            print(f"    Error: response.text was None or attribute error from Gemini response object.")
-            return "Error: Response Attribute", default_error_explanation, default_error_summary
-
-    except Exception as e_api:
-        print(f"    Major Error during Gemini API call or critical response issue: {type(e_api).__name__} - {e_api}")
-        print(traceback.format_exc()) # Print full traceback for API errors
-        # Also print the raw response text if available and different from default
-        if raw_response_text_for_debug != "No response received":
-            print(f"    Raw text received before error (if any - first 1000 chars):\n{raw_response_text_for_debug[:1000]}")
-        return f"API Exception: {type(e_api).__name__}", default_error_explanation, default_error_summary
+    except json.JSONDecodeError as e_json:
+        print(f"    Error decoding JSON: {e_json}")
+        return "Error: JSON Decode", f"JSON Error - {e_json}", f"JSON Error - {e_json}"
+    except Exception as e_parse:
+        print(f"    Error parsing response: {e_parse}")
+        return "Error: Parsing", default_error_explanation, default_error_summary
 
 # ## -------- DSPACE DATA RETRIEVAL --------
 
