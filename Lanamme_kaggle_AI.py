@@ -280,10 +280,23 @@ def fetch_pdf_bytes_with_urllib(initial_url, max_redirects_ignored=5, timeout=45
             info = response.info() # This is an http.client.HTTPMessage object
             content_type = info.get('Content-Type', '').lower()
 
-            if 'application/pdf' not in content_type:
+            # if 'application/pdf' not in content_type:
+            #     print(f"  urllib: ERROR - Content-Type is '{content_type}', not 'application/pdf'. Final URL: {final_url}")
+            #     return None
+
+            # ### CHANGE HERE: Logic to accept .crdownload or forced handling ###
+            is_crdownload = '.crdownload' in final_url.lower() or '.crdownload' in current_url.lower()
+            
+            # If it's NOT a pdf AND NOT a crdownload, we reject it.
+            # But if it IS a crdownload, we let it pass through.
+            if 'application/pdf' not in content_type and not is_crdownload:
                 print(f"  urllib: ERROR - Content-Type is '{content_type}', not 'application/pdf'. Final URL: {final_url}")
                 return None
-
+            
+            if is_crdownload:
+                print(f"  urllib: WARNING - .crdownload detected. Ignoring Content-Type '{content_type}' and forcing download.")
+            # ###############################################################
+            
             pdf_bytes = response.read()
             print(f"  urllib: PDF downloaded successfully from {final_url}. Size: {len(pdf_bytes)} bytes.")
             return pdf_bytes
